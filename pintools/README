@@ -6,7 +6,10 @@ Type 'make'.
 
 The 'scripts' directory contains some example scripts for using the tools. They assume that 
 the location of the pin.sh script (from the pin toolkit) is in your path. Take a look at the scripts
-for an example of how to use each tool. Tool descriptions are provided below. 
+for an example of how to use each tool. The scripts rely on a variable CUSTOM_PINTOOLS_HOME, which points to vividperf/pintools.
+
+Tool descriptions are provided below. 
+
 
 Tools:
 
