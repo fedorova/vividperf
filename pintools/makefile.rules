@@ -1,0 +1,17 @@
+##############################################################
+#
+# This file includes all the test targets as well as all the
+# non-default build rules and test recipes.
+#
+##############################################################
+
+
+##############################################################
+#
+# Tools targets
+#
+##############################################################
+
+TEST_TOOL_ROOTS := procinstr showprocs-dynamic showprocs-static null
+
+TOOL_LIBS += -lrt

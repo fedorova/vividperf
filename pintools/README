@@ -1,0 +1,31 @@
+To compile pintools, download and unpack the pin toolkit from the Intel's website: 
+http://software.intel.com/en-us/articles/pin-a-dynamic-binary-instrumentation-tool
+
+Set the PIN_ROOT environmental variable to point to the root  directory of the toolkit. 
+Type 'make'.
+
+The 'scripts' directory contains some example scripts for using the tools. They assume that 
+the location of the pin.sh script (from the pin toolkit) is in your path. Take a look at the scripts
+for an example of how to use each tool. Tool descriptions are provided below. 
+
+Tools:
+
+==========================================
+showprocs-static.so (showprocs-static.sh)
+==========================================
+This tool loads the binary images required by the target program and outputs into a file all the functions contained within the images. The default output file is procs-static.out, but you can specify your own as the script shows. Knowing the function names in your image is useful when deciding which functions you want to instrument, because compilers sometimes modify function names from their names in the program. 
+
+===========================================
+showprocs-dynamic.so (showprocs-dynamic.sh)
+===========================================
+This tool interposes on all the functions in your binary, counts the number of times they are executed and outputs to the file only those functions that were actually invoked along with their invocation counts. The default output file is procs-dynamic.out, but you can specify your own as the script shows. Knowing the function names in your image is useful when deciding which functions you want to instrument, because compilers sometimes modify function names from their names in the program. 
+
+===========================
+procinstr.so (procinstr.sh)
+===========================
+This tool instruments the functions of your choice with timing and outputs the average number of nanoseconds per invocation to the output file (procinstr.out by default). You must specify the functions to instrument in a file (procnames.in by default). A sample input file is provided in the scripts directory.
+
+==================
+null.so (null.sh)
+==================
+This tool simply makes pin launch your program. It is used to measure the overhead on your program from running under pin. The overhead should be negligible for long-running programs. 
