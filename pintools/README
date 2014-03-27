@@ -8,27 +8,68 @@ The 'scripts' directory contains some example scripts for using the tools. They 
 the location of the pin.sh script (from the pin toolkit) is in your path. Take a look at the scripts
 for an example of how to use each tool. The scripts rely on a variable CUSTOM_PINTOOLS_HOME, which points to vividperf/pintools.
 
-Tool descriptions are provided below. 
+Tool descriptions are provided below. The name in paretheses is the name of the script in the "scripts" directory that shows how to launch this tool. 
 
 
 Tools:
+==================
+null.so (null.sh)
+==================
+This tool simply makes pin launch your program. It is used to measure the overhead on your program from running under pin. The overhead should be negligible for long-running programs. 
 
-==========================================
-showprocs-static.so (showprocs-static.sh)
-==========================================
-This tool loads the binary images required by the target program and outputs into a file all the functions contained within the images. The default output file is procs-static.out, but you can specify your own as the script shows. Knowing the function names in your image is useful when deciding which functions you want to instrument, because compilers sometimes modify function names from their names in the program. 
+===========================
+procinstr.so (procinstr.sh)
+===========================
+This tool instruments the functions of your choice with timing and outputs the average number of nanoseconds per invocation to the output file (procinstr.out by default). You must specify the functions to instrument in a config file. 
+
+-i <input file|procnames.in> -- this file specifies the names of the procedures that will be
+   	  		     instrumented (procnames.in by default). A sample procnames.in file 
+			     is provided in the scripts directory.
+
+-o <output file|procinstr.out> -- this configuration option specifies the output file where
+   	   		       the instrumentation results will be placed. 
+			       procinstr.out is the default. 
 
 ===========================================
 showprocs-dynamic.so (showprocs-dynamic.sh)
 ===========================================
 This tool interposes on all the functions in your binary, counts the number of times they are executed and outputs to the file only those functions that were actually invoked along with their invocation counts. The default output file is procs-dynamic.out, but you can specify your own as the script shows. Knowing the function names in your image is useful when deciding which functions you want to instrument, because compilers sometimes modify function names from their names in the program. 
 
-===========================
-procinstr.so (procinstr.sh)
-===========================
-This tool instruments the functions of your choice with timing and outputs the average number of nanoseconds per invocation to the output file (procinstr.out by default). You must specify the functions to instrument in a file (procnames.in by default). A sample input file is provided in the scripts directory.
+-o <output file|procs-dynamic.out> -- this configuration option specifies the output file where
+   	   			   the procedures will be put. procs-dynamic.out is the default. 
 
-==================
-null.so (null.sh)
-==================
-This tool simply makes pin launch your program. It is used to measure the overhead on your program from running under pin. The overhead should be negligible for long-running programs. 
+==========================================
+showprocs-static.so (showprocs-static.sh)
+==========================================
+This tool loads the binary images required by the target program and outputs into a file all the functions contained within the images. The default output file is procs-static.out, but you can specify your own as the script shows. Knowing the function names in your image is useful when deciding which functions you want to instrument, because compilers sometimes modify function names from their names in the program. 
+
+-o <output file|procs-static.out> -- this configuration option specifies the output file where
+   	   			  the procedures will be put. procs-static.out is the default. 
+
+==========================================
+straggler-catcher.so (straggler-catcher.sh)
+==========================================
+This tool detects functions that are taking too long to complete. These functions are called "stragglers", hence the name straggler-catcher. It works by instrumenting the functions of interest and monitoring their completion times. The completion times are monitored inline (checked on function exit) and in a separate thread. So if a function is stuck sleeping, and hence taking too long to run, the tool will also detect that. Upon detection of a straggler the tool invokes a user defined shell script. 
+
+-i <config file|stragglers.in> -- a configuration file that tells the script which
+   	   		       functions to watch and their latency thresholds. The
+			       latency threshold tells the tool how long the function
+			       must take to run before it is considered a straggler. 
+			       Format: on each line speciy: <func> <number> <time unit>, as in:
+
+			       myfunc  10 ms
+
+			       which means that myfunc should be flagged as a straggler
+			       if it takes more than 10ms to complete. Supported time units
+			       are: ns, us, ms, s.
+
+-s <script|my_script.sh> -- this script is invoked every time we catch a straggler. The script
+   			 is written by the user. The tool passes the following arguments
+			 to the script: application pid, function name, elapsed time in 
+			 nanoseconds. An example my_script.sh that simply prints the 
+			 arguments provided by the tool is provided in the scripts directory.
+
+-t <time in ms|1000> -- this tells us how often the checker thread inside the tool should
+   	    	     	wake up to check for stragglers. This time interval should be 
+			provided in milliseconds, and the default is 1000. 
+
