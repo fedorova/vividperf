@@ -12,6 +12,7 @@
 #
 ##############################################################
 
-TEST_TOOL_ROOTS := procinstr showprocs-dynamic showprocs-static null
+TEST_TOOL_ROOTS := null procinstr showprocs-dynamic showprocs-static straggler-catcher
 
 TOOL_LIBS += -lrt
+TOOL_CXXFLAGS += -std=c++0x

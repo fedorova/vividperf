@@ -57,12 +57,10 @@ KNOB<string> KnobInputFile(KNOB_MODE_WRITEONCE, "pintool",
 
 /* ===================================================================== */
 
-
-/* Holds names of routines we want to instrument
- * Because of inlining there can be more than one
- * instance of a routine with the same name, and we
- * will track those instances separately, so we 
- * keep the name list separate from the routine object list. 
+/* Holds names of functions the user wants us to track.
+ * Not all of them will be valid. Validity will be checked on
+ * image load, which is when valid functions will get an associated
+ * function record and will get put into a list. 
  */
 typedef struct RtnName
 {
@@ -174,8 +172,8 @@ VOID Image(IMG img, VOID *v)
 
 VOID buildProcedureList(ifstream& f)
 {
-    string procName;
 
+    cout << "Routines specified for instrumentation:" << endl;
     while(!f.eof())
     {
 	RTN_NAME *rn = new RTN_NAME;

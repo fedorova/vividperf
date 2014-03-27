@@ -1,0 +1,54 @@
+This set of scripts is the wrapper to the git bisect tool. They automate the use of the tool to help find performance regressions. 
+
+There are several of scripts that interact with one another and use git bisect. These scripts are:
+
+go-track.sh
+track-regression.sh
+run-test.sh
+label-perf.py
+
+The following diagram schematically shows how the scripts interact:
+https://camo.githubusercontent.com/4f7c6adbf7a41278e58e1e1163ef58666a7058e9/687474703a2f2f777777322e63732e7366752e63612f2537456665646f726f76612f74656d702f747261636b2d72656772657373696f6e2e706e67
+
+
+Pre-requisites:
+
+The top level script is go-track.sh. Prior to running it, you need to tell git to begin bisecting and to specify the endpoints:
+
+git bisect start
+git bisect good <commit #>
+git bisect bad <commit #>
+
+(see comments in track-regression.sh for more details).
+
+Also, before running the scripts you need to modify track-regression.sh and run-test.sh to point them to the directories where the WiredTiger library lives and tell them how to build the library and your test as well as how to run the test. You will also need to specify the performance threshold based on which the scripts will decide whether a particular revision was bad or good. The performance threshold and the units in which the performance is measured is specified in the variable LABEL_PERF_ARGS in track-regression.sh.
+
+How the scripts work
+
+The script track-regression.sh performs a single iteration of determining whether a commit is "good" or "bad". It dumps all the output in the file track.out, so you can use it to examine any output from the builds, performance tests and the git-bisect command.
+
+The script go-track.sh runs track-regression.sh in a loop until the file track.out is found to contain the commit hash of the "bad" revision -- the one where we first observed the performance under the threshold.
+
+So track-regression does all the heavy lifting. It works as follows:
+
+    Tells git bisect to select a next revision for testing
+    Runs your performance test (by invoking run-test.sh), which outputs the performance results into perf.txt
+    Invokes label-perf.py, which parses the contents of perf.txt and decides whether the performance was good or bad based on the performance threshold provided in LABEL_PERF_ARGS in track-regression.sh
+    Tells git to label the current revision as good or bad based on the previous step. Or skips it if performance could not be measured (e.g., the revision didn't build).
+
+If you want to track regression manually, step by step, for instance, to make sure that thing built correctly every time or to examine the performance output before proceeding, you can just invoke track-regression manually until you see a string " is the first bad revision" output by git bisect.
+LABEL_PERF_ARGS variable
+
+This variable contains the arguments to label-perf.py, which decides whether the obtained performance was "good" or "bad". So in that variable you'll need to specify the threshold performance number for performing the comparison, the units in which performance is measured (as printed in the perf.txt file by your run-test.sh script), and either 'greater' or 'less' depending if a badly-performing revision would have a performance value greater or smaller than the threshold you specified.
+
+For example, you could configure this variable as follows:
+
+LABEL_PERF_ARGS="0.230 micros/op; greater perf.txt"
+
+to say that if the perf.txt gives me the performance of greater than 0.230 micros/op; then this revision should be labeled as "bad", otherwise as "good".
+
+perf.txt may contain any output from your benchmark including the performance numbers. The script label.py will search perf.txt for all performance numbers in the format
+
+    [number][unit you specified].
+
+It will average them and compare to the threshold that you provided. Based on that, it will label the revision either good or bad. The parent script will then communicate the label to git bisect.
