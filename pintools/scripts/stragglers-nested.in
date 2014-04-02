@@ -1,0 +1,9 @@
+__curfile_search 50 ms
+* __wt_page_in
+* __wt_cache_full_check
+* __wt_evict_lru_page
+* __wt_evict_page
+* __wt_rec_evict
+* __wt_rec_write
+* __wt_split_page_inmem
+* __wt_btcur_search

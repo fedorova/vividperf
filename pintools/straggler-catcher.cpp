@@ -76,8 +76,6 @@ KNOB<UINT32> KnobTimeInterval(KNOB_MODE_WRITEONCE, "pintool",
 
 
 /* ===================================================================== */
-
-/* ===================================================================== */
 /* Data Structures and helper routines */
 /* ===================================================================== */
 
@@ -90,6 +88,7 @@ typedef struct func_name
 {
     string name;
     UINT64 threshold;
+    vector<string> trackedFuncs;
     struct func_name * next;
 } FuncName;
 
@@ -113,6 +112,15 @@ typedef struct thread_local_data
     UINT8 padding[CACHE_LINE_SIZE-sizeof(UINT64)*2-sizeof(char)];
 } ThrLocData; 
 
+struct func_record;
+
+typedef struct tracked_func_record
+{
+    string name;
+    BOOL* wasCalled;
+    struct func_record *parentFR;
+} TrackedFuncRecord;
+
 typedef struct func_record
 {
     string name;
@@ -120,6 +128,7 @@ typedef struct func_record
     string image;
     ADDRINT address;
     ThrLocData *thrFuncRecords;
+    vector<TrackedFuncRecord*> trackedFuncs;
 } FuncRecord;
 
 
@@ -188,6 +197,17 @@ int allocMoreSpaceAndCopy()
 	memcpy((void*)newArray, fr->thrFuncRecords, threadArraySize * sizeof(ThrLocData));
 	
 	fr->thrFuncRecords = newArray;
+
+	/* Now do this for tracked functions */
+	for (auto & t: fr->trackedFuncs)
+	{
+	    BOOL *newBoolArray = new BOOL[newsize];
+	    memset((void*)newBoolArray, 0, newsize * sizeof(BOOL));
+	    memcpy((void*)newBoolArray, t->wasCalled, threadArraySize * sizeof(BOOL));
+
+	    t->wasCalled = newBoolArray;
+	}
+
 	threadArraySize = newsize;
 	cout << "Reallocated space for " << fr->name << endl;
     }
@@ -262,37 +282,29 @@ const char * StripPath(const char * path)
 /* ===================================================================== */
  
 /* This is what we do if we catch a straggler. */
-inline VOID stragglerCaught(FuncRecord *fr, THREADID threadid, UINT64 elapsedTime)
+inline VOID stragglerCaught(FuncRecord *fr, THREADID threadid, UINT64 elapsedTime, string funcsCalled)
 {
     int ret;
 
     if(scriptProvided)
     {
-	UINT maxlen = strlen(scriptCMDPartI) + strlen(fr->name.c_str()) + 55;
+	UINT maxlen = strlen(scriptCMDPartI) + strlen(fr->name.c_str()) + strlen(funcsCalled.c_str()) + 55;
 	char* scriptCMD = (char *) malloc(maxlen);
 	if(scriptCMD == NULL)
 	{
 	    cerr << "Couldn't malloc " << endl;
 	    exit(-1);
 	}
-	snprintf(scriptCMD, maxlen, "%s %s %ld\n",  scriptCMDPartI, fr->name.c_str(), 
-		 elapsedTime);
-	
+	snprintf(scriptCMD, maxlen, "%s %s %ld %s\n",  scriptCMDPartI, fr->name.c_str(), 
+		 elapsedTime, funcsCalled.c_str());
+
 	ret = system(scriptCMD);
 	if(ret)
 	{
 	    cerr << "Couldn't invoke user-defined script from straggler catcher " << endl;
 	    exit(-1);
 	}
-	cout<<scriptCMD;
     }
-
-/*
-    cout << "Caught straggler: " << fr->name << ", thread: " << threadid 
-	 << ", threshold: " << fr->latencyThreshold 
-	 << ", elapsed: " << elapsedTime << ", tle " 
-	 << fr->thrFuncRecords[threadid].timeAtLastEntry << endl;
-*/
 }
 
 
@@ -327,7 +339,20 @@ inline BOOL catchStraggler(FuncRecord *fr, THREADID threadid)
 
     if(elapsedTime > fr->latencyThreshold)
     {
-	stragglerCaught(fr, threadid, elapsedTime);
+	/* If we are tracking function calls within the straggler
+	 * function, we will report the ones that were called
+	 * to the user. Construct a string.
+	 */
+	stringstream funcsCalled;
+
+	for (auto & t: fr->trackedFuncs)
+	{
+	    if(t->wasCalled[threadid])
+		funcsCalled << t->name << " "; 
+
+	}
+	
+	stragglerCaught(fr, threadid, elapsedTime, funcsCalled.str());
 	caught = TRUE;
     }
     return caught;
@@ -340,10 +365,15 @@ VOID callBefore(FuncRecord *fr)
 
     assert(fr->thrFuncRecords[threadid].valid);
 
-    /* No error checking here, because this has to be fast.
-     * Hopefully we've done enough error checking earlie, so
-     * the chance of bad things happening here is very low. 
+    /* Reset the wasCalled flags. With every new 
+     * parent function invocation, we want to begin
+     * tracking the nested funcs anew.
      */
+    for (auto & t: fr->trackedFuncs)
+    {
+	t->wasCalled[threadid] = FALSE;
+    }
+
     clock_gettime(CLOCK_REALTIME, &ts);
     fr->thrFuncRecords[threadid].timeAtLastEntry = ts.tv_sec * BILLION + ts.tv_nsec;
 }
@@ -364,6 +394,19 @@ VOID callAfter(FuncRecord *fr)
     fr->thrFuncRecords[threadid].invCount++;
     fr->thrFuncRecords[threadid].timeAtLastEntry = 0;
 
+}
+
+VOID callBeforeTracked(TrackedFuncRecord *tfr)
+{
+    THREADID threadid = PIN_ThreadId();
+    tfr->wasCalled[threadid] = TRUE;
+    /*
+    cout << tfr->name << " by thread " << threadid << endl;
+    if(tfr->parentFR->thrFuncRecords[threadid].timeAtLastEntry > 0)
+	cout << "parent func in progress "<< endl;
+    else
+	cout << "not within parent func "<< endl;
+    */
 }
 
 /* Should be used by the straggler-catcher thread. 
@@ -400,11 +443,7 @@ VOID stragglerCatcherThread(void *arg)
 	    {
 		ThrLocData *tld = &(fr->thrFuncRecords[i]);
 		if(tld->valid)
-		{
-		    BOOL caught = catchStraggler(fr, i);
-		    if(caught)
-			cout << "*";
-		}
+		    catchStraggler(fr, i);
 	    }
 	} 
 	PIN_ReleaseLock(&lock);
@@ -501,6 +540,42 @@ VOID Image(IMG img, VOID *v)
 
 	    fr->thrFuncRecords[threadid].valid = 1;
 
+	    /* Ok, now let's see if we have any nested functions
+	     * to track. If so, let's create per-thread records
+	     * for them and instrument them to mark themselves as
+	     * "I was called" just after they were called. 
+	     */
+	    for(auto & t: fn->trackedFuncs)
+	    {
+	      TrackedFuncRecord *tfr = new TrackedFuncRecord();
+		tfr->name = t;
+		tfr->parentFR = fr;
+		tfr->wasCalled = new BOOL[threadArraySize];
+		memset((void*)tfr->wasCalled, 0, threadArraySize*sizeof(BOOL));
+
+		/* Now instrument the routine to mark itself as "called" as soon as 
+		 * it is called. */
+		RTN rtn = RTN_FindByName(img, tfr->name.c_str());
+		if (RTN_Valid(rtn))
+		{
+		    cout << tfr->name << " located" << endl;
+		    RTN_Open(rtn);
+		    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBeforeTracked,
+				   IARG_PTR, tfr, IARG_END);
+		    RTN_Close(rtn);
+		}
+
+		fr->trackedFuncs.push_back(tfr);
+	    }		
+
+	    // Instrument 
+	    RTN_Open(rtn);
+	    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBefore,
+			   IARG_PTR, fr, IARG_END);
+	    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)callAfter,
+			   IARG_PTR, fr, IARG_END);
+	    RTN_Close(rtn);
+
 	    // Add to the map of routines
 	    pair<string, FuncRecord*> record(fr->name, fr);
 
@@ -508,15 +583,7 @@ VOID Image(IMG img, VOID *v)
 	    funcMap.insert(record);
 	    PIN_ReleaseLock(&lock);
 
-	    RTN_Open(rtn);
 
-	    // Instrument 
-	    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBefore,
-			   IARG_PTR, fr, IARG_END);
-	    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)callAfter,
-			   IARG_PTR, fr, IARG_END);
-
-	    RTN_Close(rtn);
 	}
     } 
 }
@@ -564,12 +631,24 @@ FuncName* getFN(vector<string> elems){
     return fn;
 }
 
+#define SHOW_ERROR_AND_RETURN(elems)					\
+    do {								\
+    unsigned int k;							\
+    cerr << "Invalid file format. Offending words are: " << endl;	\
+    for(k = 0; k < elems.size(); k++)					\
+	cout << "<" << elems[k] << ">" << endl;				\
+    return -1;								\
+    }									\
+    while(0);
+
+
+
 int buildFuncList(ifstream& f)
 {
     while(!f.eof())
     {
 	vector<string> elems;
-	int i;
+	string line;
 	
 	/* We are looking for sets of three tokens:
 	 * func name, value of threshold, time unit for threshold.
@@ -577,15 +656,29 @@ int buildFuncList(ifstream& f)
 	 *         my_func 3 s
 	 * which means that if my_func takes more than 3 seconds to 
 	 * run, we will catch it as a straggler. 
+	 * 
+	 * We may also see a set of lines like this after a straggler definition:
+	 *
+	 *        * __myfunc1
+	 *        * __myfunc2
+	 *
+	 * This means that we want to track whenever __myfunc1 and __myfunc2
+	 * are called within the stragger function. 
 	 */ 
-	for(i = 0; !f.eof() && i < 3; i++)
+	getline(f, line);
+
+	/* Now let's break up the line into words */
+	istringstream str(line);
+	while(!str.eof())
 	{
 	    string word;
-	    f >> word;
+	    str >> word;
 
 	    if(word.length() > 0)
 		elems.push_back(word);
 	}
+	
+	/* Now let's check for the two patterns we are looking for */
 	if(elems.size() == 3)
 	{
 	    FuncName *fn = getFN(elems);
@@ -595,14 +688,27 @@ int buildFuncList(ifstream& f)
 	    fn->next = funcNameList;
 	    funcNameList = fn;
 	}
-	else if(elems.size() != 0)
+	else if( (elems.size() == 2) &&  (elems[0].length() == 1) && 
+		 (!strcmp(elems[0].c_str(), "*")) )
 	{
-	    unsigned int k;
-	    cerr << "Invalid file format. Offending words are: " << endl;
-	    for(k = 0; k < elems.size(); k++)
-		cout << "<" << elems[k] << ">" << endl;
-	    return -1; 
+	    /* We are here if we are seeing the format:
+	     *     __func <num> <unit>
+	     *     * __func1
+	     *     * __func2
+	     * This means that we want to track __func1 and __func2
+	     * if they are called within __func.
+	     * So __func must have been already defined and it's at
+	     * the top of the funcNameList.
+	     */
+
+	    FuncName *fn = funcNameList;
+	    if(fn == NULL)
+		SHOW_ERROR_AND_RETURN(elems);
+
+	    fn->trackedFuncs.push_back(elems[1]);
 	}
+	else if(elems.size() != 0)
+	    SHOW_ERROR_AND_RETURN(elems);
 	
     }
 
@@ -620,15 +726,23 @@ INT32 Usage()
     cerr << endl << KNOB_BASE::StringKnobSummary() << endl;
     cerr << "This tool catches functions that exceed their user-defined latency threshold." 
 	 << endl;
-    cerr << "We expect an input file containing sets of 3 words in the form: " << endl;
+    cerr << "In an input file we expect a straggler definition in the following format: " << endl;
     cerr << "<func_name> <value> <unit>" << endl;
     cerr << "For example: "<< endl;
-    cerr << "my_func 3 ns" << endl;
+    cerr << endl;
+    cerr << "   my_func 3 ns" << endl;
     cerr << endl;
     cerr << "In this case we will catch my_func() as a straggler if it runs for "
 	 << " more than 3 nanoseconds." << endl;
     cerr << "Valid units are: s, ms, us, ns." << endl;
-
+    cerr << endl;
+    cerr << "The straggler definition may be optionally followed by one or more lines like this:" << endl;
+    cerr << endl;
+    cerr << "   * my_func1" << endl;
+    cerr << "   * my_func2" << endl;
+    cerr << endl;
+    cerr << "In this case, the straggler-catcher will track whether my_func1 and my_func2 were called "
+	"by the straggler function. " << endl;
     return -1;
 }
 

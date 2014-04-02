@@ -11,8 +11,9 @@
 # Tools targets
 #
 ##############################################################
-
 TEST_TOOL_ROOTS := null procinstr showprocs-dynamic showprocs-static straggler-catcher
 
 TOOL_LIBS += -lrt
-TOOL_CXXFLAGS += -std=c++0x
+TOOL_CXXFLAGS += -std=c++0x -g
+TOOL_CXXFLAGS_NOOPT=1
+DEBUG = 1

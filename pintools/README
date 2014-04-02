@@ -51,9 +51,9 @@ straggler-catcher.so (straggler-catcher.sh)
 ==========================================
 This tool detects functions that are taking too long to complete. These functions are called "stragglers", hence the name straggler-catcher. It works by instrumenting the functions of interest and monitoring their completion times. The completion times are monitored inline (checked on function exit) and in a separate thread. So if a function is stuck sleeping, and hence taking too long to run, the tool will also detect that. Upon detection of a straggler the tool invokes a user defined shell script. 
 
--i <config file|stragglers.in> -- a configuration file that tells the script which
-   	   		       functions to watch and their latency thresholds. The
-			       latency threshold tells the tool how long the function
+-i <config file|stragglers.in> -- a configuration file that provides *straggler definitions*, 
+   	   		       i.e., tells the script which functions to watch and their latency thresholds. 
+			       The latency threshold tells the tool how long the function
 			       must take to run before it is considered a straggler. 
 			       Format: on each line speciy: <func> <number> <time unit>, as in:
 
@@ -62,6 +62,17 @@ This tool detects functions that are taking too long to complete. These function
 			       which means that myfunc should be flagged as a straggler
 			       if it takes more than 10ms to complete. Supported time units
 			       are: ns, us, ms, s.
+
+			       The straggler definition may be optionally followed by one or more lines 
+			       like this:
+
+			       * my_func1
+			       * my_func2
+
+			       In this case, the straggler-catcher wil track whether my_func1 and my_func2
+			       were called from within the straggler. This functionality is useful to 
+			       check whether a particular execution path was invoked upon a long-latency
+			       invocation and actually was responsible for making the function a straggler. 
 
 -s <script|my_script.sh> -- this script is invoked every time we catch a straggler. The script
    			 is written by the user. The tool passes the following arguments
