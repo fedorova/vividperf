@@ -62,25 +62,22 @@ This tool detects functions that are taking too long to complete. These function
 			       which means that myfunc should be flagged as a straggler
 			       if it takes more than 10ms to complete. Supported time units
 			       are: ns, us, ms, s.
-
-			       The straggler definition may be optionally followed by one or more lines 
-			       like this:
-
-			       * my_func1
-			       * my_func2
-
-			       In this case, the straggler-catcher wil track whether my_func1 and my_func2
-			       were called from within the straggler. This functionality is useful to 
-			       check whether a particular execution path was invoked upon a long-latency
-			       invocation and actually was responsible for making the function a straggler. 
+. 
 
 -s <script|my_script.sh> -- this script is invoked every time we catch a straggler. The script
    			 is written by the user. The tool passes the following arguments
 			 to the script: application pid, function name, elapsed time in 
-			 nanoseconds. An example my_script.sh that simply prints the 
-			 arguments provided by the tool is provided in the scripts directory.
+			 nanoseconds and optionally a funciton trace (see below). An example 
+			 my_script.sh that simply prints the arguments provided by the tool 
+			 is provided in the scripts directory.
 
 -t <time in ms|1000> -- this tells us how often the checker thread inside the tool should
    	    	     	wake up to check for stragglers. This time interval should be 
 			provided in milliseconds, and the default is 1000. 
 
+
+-trace <0 or 1 | 0> -- providing a "1" with this option enables recording all functions called 
+       	       	       within a straggler function. Once the straggler is caught, the trace
+		       will be supplied as an argument to the user-defined script, which can 
+		       display the trace to the user. See my_script.sh in the 'scripts' directory
+		       for an example.

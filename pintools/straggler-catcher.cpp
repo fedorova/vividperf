@@ -36,7 +36,8 @@ END_LEGAL */
   * the user-defined script. That scripts can do various things
   * to react to our catching of a long-latency spike: attach to the
   * program with the debugger, gather more stats, send an SMS to the
-  * user, etc. 
+  * user, etc. We also optionally collect a stack-trace of some sort --
+  * a list of names of all functions that were called by the straggler. 
   */
 
 #include <assert.h>
@@ -60,6 +61,8 @@ UINT numAppThreads = 0;
 BOOL scriptProvided = FALSE;
 char* scriptCMDPartI;
 
+#define LOUD 0
+
 /* ===================================================================== */
 /* Commandline Switches */
 /* ===================================================================== */
@@ -71,9 +74,11 @@ KNOB<string> KnobScriptPath(KNOB_MODE_WRITEONCE, "pintool",
     "s", "", "specify the full path of the script to invoke when we catch a straggler");
 
 KNOB<UINT32> KnobTimeInterval(KNOB_MODE_WRITEONCE, "pintool",
-    "t", "1000", "stragger catcher thread should check for stragglers every that many milliseconds");
+    "t", "1000", "straggler catcher thread should check for stragglers every that many milliseconds");
 
-
+KNOB<BOOL> KnobStackTrace(KNOB_MODE_WRITEONCE, "pintool",
+		       "trace", "0", 
+		       "set to 1 if you want to record a stack trace within the tracked function");
 
 /* ===================================================================== */
 /* Data Structures and helper routines */
@@ -88,7 +93,6 @@ typedef struct func_name
 {
     string name;
     UINT64 threshold;
-    vector<string> trackedFuncs;
     struct func_name * next;
 } FuncName;
 
@@ -103,23 +107,19 @@ unsigned int threadArraySize = 32;
 unsigned int largestUnusedThreadID = 0;
 
 #define CACHE_LINE_SIZE 64
+#define STACK_LIMIT 8192
 
 typedef struct thread_local_data
 {
     UINT64 timeAtLastEntry;
     UINT64 invCount;
     char valid;
-    UINT8 padding[CACHE_LINE_SIZE-sizeof(UINT64)*2-sizeof(char)];
+    char stackTrace[STACK_LIMIT];
+    int stackBufPosition;
+    UINT8 padding[CACHE_LINE_SIZE-sizeof(UINT64)*2-sizeof(char)-sizeof(int)];
 } ThrLocData; 
 
 struct func_record;
-
-typedef struct tracked_func_record
-{
-    string name;
-    BOOL* wasCalled;
-    struct func_record *parentFR;
-} TrackedFuncRecord;
 
 typedef struct func_record
 {
@@ -128,8 +128,15 @@ typedef struct func_record
     string image;
     ADDRINT address;
     ThrLocData *thrFuncRecords;
-    vector<TrackedFuncRecord*> trackedFuncs;
 } FuncRecord;
+
+/* This is an array of per-thread pointers to FuncRecord.
+ * Whenever a thread enters one of the tracked function it sets
+ * this pointer. This way we know when to record stack traces.
+ * We only record the stack traces if we are within a tracked
+ * function. 
+ */
+FuncRecord **funcRecordArray;
 
 
 /* This where we store function records keyed by the function name. 
@@ -198,16 +205,6 @@ int allocMoreSpaceAndCopy()
 	
 	fr->thrFuncRecords = newArray;
 
-	/* Now do this for tracked functions */
-	for (auto & t: fr->trackedFuncs)
-	{
-	    BOOL *newBoolArray = new BOOL[newsize];
-	    memset((void*)newBoolArray, 0, newsize * sizeof(BOOL));
-	    memcpy((void*)newBoolArray, t->wasCalled, threadArraySize * sizeof(BOOL));
-
-	    t->wasCalled = newBoolArray;
-	}
-
 	threadArraySize = newsize;
 	cout << "Reallocated space for " << fr->name << endl;
     }
@@ -239,8 +236,6 @@ VOID markThreadRecValid(unsigned int threadid)
     for (auto& x: funcMap) 
     {
     	FuncRecord *fr = x.second;
-	assert(fr->thrFuncRecords);
-
 	fr->thrFuncRecords[threadid].valid = 1;
     }
 }
@@ -282,23 +277,25 @@ const char * StripPath(const char * path)
 /* ===================================================================== */
  
 /* This is what we do if we catch a straggler. */
-inline VOID stragglerCaught(FuncRecord *fr, THREADID threadid, UINT64 elapsedTime, string funcsCalled)
+inline VOID stragglerCaught(FuncRecord *fr, THREADID threadid, UINT64 timeOfEntry, 
+			    UINT64 timeOfExit, char* funcsCalled)
 {
     int ret;
 
     if(scriptProvided)
     {
-	UINT maxlen = strlen(scriptCMDPartI) + strlen(fr->name.c_str()) + strlen(funcsCalled.c_str()) + 55;
+	UINT maxlen = strlen(scriptCMDPartI) + strlen(fr->name.c_str()) + strlen(funcsCalled) + 100;
 	char* scriptCMD = (char *) malloc(maxlen);
 	if(scriptCMD == NULL)
 	{
 	    cerr << "Couldn't malloc " << endl;
 	    exit(-1);
 	}
-	snprintf(scriptCMD, maxlen, "%s %s %ld %s\n",  scriptCMDPartI, fr->name.c_str(), 
-		 elapsedTime, funcsCalled.c_str());
+	snprintf(scriptCMD, maxlen, "%s %d %s %lu %lu %s\n",  scriptCMDPartI, 
+		 PIN_GetTid(), fr->name.c_str(), timeOfEntry, timeOfExit, funcsCalled);
 
 	ret = system(scriptCMD);
+
 	if(ret)
 	{
 	    cerr << "Couldn't invoke user-defined script from straggler catcher " << endl;
@@ -324,7 +321,7 @@ inline BOOL catchStraggler(FuncRecord *fr, THREADID threadid)
     if(fr->thrFuncRecords[threadid].timeAtLastEntry == 0)
 	return FALSE;
 
-    clock_gettime(CLOCK_REALTIME, &timeAfter);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &timeAfter);
     timeNow = (timeAfter.tv_sec * BILLION + timeAfter.tv_nsec);
     elapsedTime = timeNow -
 	fr->thrFuncRecords[threadid].timeAtLastEntry;
@@ -336,23 +333,21 @@ inline BOOL catchStraggler(FuncRecord *fr, THREADID threadid)
     if(elapsedTime == timeNow)
 	return FALSE;
 
+    if(LOUD)
+	cout << fr->name << "  took " << elapsedTime << " ns." << endl; 
 
     if(elapsedTime > fr->latencyThreshold)
     {
-	/* If we are tracking function calls within the straggler
-	 * function, we will report the ones that were called
-	 * to the user. Construct a string.
-	 */
-	stringstream funcsCalled;
-
-	for (auto & t: fr->trackedFuncs)
-	{
-	    if(t->wasCalled[threadid])
-		funcsCalled << t->name << " "; 
-
-	}
 	
-	stragglerCaught(fr, threadid, elapsedTime, funcsCalled.str());
+	if(KnobStackTrace)
+	    stragglerCaught(fr, threadid, 
+			    fr->thrFuncRecords[threadid].timeAtLastEntry, timeNow,
+			    (char*)&(fr->thrFuncRecords[threadid].stackTrace));
+	
+	else
+	    stragglerCaught(fr, threadid, 
+			    fr->thrFuncRecords[threadid].timeAtLastEntry, timeNow, 
+			    (char*) "<no stacks traced>");
 	caught = TRUE;
     }
     return caught;
@@ -365,17 +360,9 @@ VOID callBefore(FuncRecord *fr)
 
     assert(fr->thrFuncRecords[threadid].valid);
 
-    /* Reset the wasCalled flags. With every new 
-     * parent function invocation, we want to begin
-     * tracking the nested funcs anew.
-     */
-    for (auto & t: fr->trackedFuncs)
-    {
-	t->wasCalled[threadid] = FALSE;
-    }
-
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     fr->thrFuncRecords[threadid].timeAtLastEntry = ts.tv_sec * BILLION + ts.tv_nsec;
+    fr->thrFuncRecords[threadid].stackBufPosition = 0;
 }
 
 VOID callAfter(FuncRecord *fr)
@@ -385,29 +372,96 @@ VOID callAfter(FuncRecord *fr)
 
     assert(fr->thrFuncRecords[threadid].valid);
 
-    /* No error checking here, because this has to be fast.
-     * Hopefully we've done enough error checking earlie, so
-     * the chance of bad things happening here is very low. 
-     */
+    PIN_GetLock(&lock, PIN_ThreadId());
     catchStraggler(fr, threadid);
+    PIN_ReleaseLock(&lock);
 
     fr->thrFuncRecords[threadid].invCount++;
     fr->thrFuncRecords[threadid].timeAtLastEntry = 0;
 
 }
 
-VOID callBeforeTracked(TrackedFuncRecord *tfr)
+
+inline VOID writeStackRecord(FuncRecord *fr, char *rtnName, char *suffix)
 {
     THREADID threadid = PIN_ThreadId();
-    tfr->wasCalled[threadid] = TRUE;
-    /*
-    cout << tfr->name << " by thread " << threadid << endl;
-    if(tfr->parentFR->thrFuncRecords[threadid].timeAtLastEntry > 0)
-	cout << "parent func in progress "<< endl;
-    else
-	cout << "not within parent func "<< endl;
-    */
+    char *localBuffer = NULL;
+    int bufferCurPosition = 0, newRecordLength = 0;
+
+
+    localBuffer = (char*)&(fr->thrFuncRecords[threadid].stackTrace);
+    bufferCurPosition = fr->thrFuncRecords[threadid].stackBufPosition;
+    newRecordLength = strlen(rtnName) + strlen(suffix)+3;
+
+    if(bufferCurPosition + newRecordLength > STACK_LIMIT)
+    {
+	cerr << "About to overflow buffer. Dropping record " << endl;
+	return;
+    }
+
+    snprintf(localBuffer + bufferCurPosition, newRecordLength, "'%s%s' \0", rtnName, suffix);
+    /* We set the new stack position to +newRecordLength-1, because we
+     * want the next record to overwrite the null character */
+    fr->thrFuncRecords[threadid].stackBufPosition += newRecordLength-1;
+
 }
+
+inline VOID recordStackTraceEnter(FuncRecord *fr, char *rtnName)
+{
+    writeStackRecord(fr, rtnName, "-->");
+}
+
+inline VOID recordStackTraceExit(FuncRecord *fr, char *rtnName)
+{
+    writeStackRecord(fr, rtnName, "<--");
+}
+
+/*
+ * Called before every function if we are recording stack traces
+ * -- i.e., which functions were called inside the tracked function. 
+ * Unfortunately, because we may track several routines, we are iterating
+ * over tracked function records. If the performance overhead is huge, 
+ * try switching to an array. 
+ */
+VOID stackTraceBefore(char *rtnName)
+{
+    THREADID tid = PIN_ThreadId();
+    for (auto& x: funcMap) 
+    {
+	FuncRecord *fr = (FuncRecord *) x.second;
+
+	/* fr->thrFuncRecords pointer must be valid and the
+	 * record associated with this thread ID must be valid.
+	 * We don't make these checks to save time. 
+	 */
+	ThrLocData *tld = &(fr->thrFuncRecords[tid]);
+
+	if(tld->timeAtLastEntry > 0)
+	    recordStackTraceEnter(fr, rtnName);
+	
+    } 
+}
+
+VOID stackTraceAfter(char *rtnName)
+{
+    THREADID tid = PIN_ThreadId();
+    for (auto& x: funcMap) 
+    {
+	FuncRecord *fr = (FuncRecord *) x.second;
+
+	/* fr->thrFuncRecords pointer must be valid and the
+	 * record associated with this thread ID must be valid.
+	 * We don't make these checks to save time. 
+	 */
+	ThrLocData *tld = &(fr->thrFuncRecords[tid]);
+	
+	if(tld->timeAtLastEntry > 0)
+	    recordStackTraceExit(fr, rtnName);
+	
+    } 
+}
+
+
 
 /* Should be used by the straggler-catcher thread. 
  * This fuction goes over all function records and checks if
@@ -455,6 +509,23 @@ VOID stragglerCatcherThread(void *arg)
     cout << "Straggler catcher thread is exiting..." << endl;
 }
 
+VOID ApplicationStart(VOID *v)
+{
+
+    timespec startTime;
+    UINT64 startTimeNS;
+
+
+    /* Display program start time */
+    clock_gettime(CLOCK_MONOTONIC_RAW, &startTime);
+    startTimeNS = startTime.tv_sec * BILLION + startTime.tv_nsec;
+
+    cout << "PID: " << PIN_GetPid() << " start time: " << startTimeNS << endl;
+
+}
+
+
+
 VOID ThreadStart(THREADID threadid, CONTEXT *ctxt, INT32 flags, VOID *v)
 {
     BOOL startCatcher = FALSE;
@@ -466,8 +537,10 @@ VOID ThreadStart(THREADID threadid, CONTEXT *ctxt, INT32 flags, VOID *v)
     largestUnusedThreadID++;
     markThreadRecValid(threadid);
     numAppThreads++;
+
     if(numAppThreads == 1)
 	startCatcher = TRUE;
+
     PIN_ReleaseLock(&lock);
     
 
@@ -502,7 +575,6 @@ VOID Image(IMG img, VOID *v)
     /* Go over all the routines we are instrumenting and insert the
      * instrumentation.
      */
-
     for (FuncName* fn = funcNameList; fn; fn = fn->next)
     { 
 	THREADID threadid;
@@ -540,34 +612,6 @@ VOID Image(IMG img, VOID *v)
 
 	    fr->thrFuncRecords[threadid].valid = 1;
 
-	    /* Ok, now let's see if we have any nested functions
-	     * to track. If so, let's create per-thread records
-	     * for them and instrument them to mark themselves as
-	     * "I was called" just after they were called. 
-	     */
-	    for(auto & t: fn->trackedFuncs)
-	    {
-	      TrackedFuncRecord *tfr = new TrackedFuncRecord();
-		tfr->name = t;
-		tfr->parentFR = fr;
-		tfr->wasCalled = new BOOL[threadArraySize];
-		memset((void*)tfr->wasCalled, 0, threadArraySize*sizeof(BOOL));
-
-		/* Now instrument the routine to mark itself as "called" as soon as 
-		 * it is called. */
-		RTN rtn = RTN_FindByName(img, tfr->name.c_str());
-		if (RTN_Valid(rtn))
-		{
-		    cout << tfr->name << " located" << endl;
-		    RTN_Open(rtn);
-		    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBeforeTracked,
-				   IARG_PTR, tfr, IARG_END);
-		    RTN_Close(rtn);
-		}
-
-		fr->trackedFuncs.push_back(tfr);
-	    }		
-
 	    // Instrument 
 	    RTN_Open(rtn);
 	    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBefore,
@@ -586,6 +630,33 @@ VOID Image(IMG img, VOID *v)
 
 	}
     } 
+    
+    if(KnobStackTrace)
+    {
+	/* Now we need to go over ALL routines in the image and insert the 
+	 * stack-tracing instrumentation */
+
+	/* Pass over all sections in an image */
+	for(SEC sec= IMG_SecHead(img); SEC_Valid(sec); sec = SEC_Next(sec) )
+	{
+	    /* Pass over all routines in a section */
+	    for(RTN rtn= SEC_RtnHead(sec); RTN_Valid(rtn); rtn = RTN_Next(rtn) )
+	    {
+		const string & rtnName = RTN_Name(rtn);
+		char *rtnName_cstr = new char[rtnName.length() + 1];
+		strcpy(rtnName_cstr, rtnName.c_str());
+
+		RTN_Open(rtn);
+		RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)stackTraceBefore,
+			       IARG_PTR, (void *)rtnName_cstr, IARG_END);
+		RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)stackTraceAfter,
+			       IARG_PTR, (void *)rtnName_cstr, IARG_END);
+		RTN_Close(rtn);
+
+	    }
+	}
+    }
+    
 }
 /* ===================================================================== */
 /* Build the list of procedures we want to instrument                    */
@@ -678,7 +749,7 @@ int buildFuncList(ifstream& f)
 		elems.push_back(word);
 	}
 	
-	/* Now let's check for the two patterns we are looking for */
+	/* Now let's check for the function runtime threshold pattern */
 	if(elems.size() == 3)
 	{
 	    FuncName *fn = getFN(elems);
@@ -687,25 +758,10 @@ int buildFuncList(ifstream& f)
 
 	    fn->next = funcNameList;
 	    funcNameList = fn;
-	}
-	else if( (elems.size() == 2) &&  (elems[0].length() == 1) && 
-		 (!strcmp(elems[0].c_str(), "*")) )
-	{
-	    /* We are here if we are seeing the format:
-	     *     __func <num> <unit>
-	     *     * __func1
-	     *     * __func2
-	     * This means that we want to track __func1 and __func2
-	     * if they are called within __func.
-	     * So __func must have been already defined and it's at
-	     * the top of the funcNameList.
-	     */
 
-	    FuncName *fn = funcNameList;
-	    if(fn == NULL)
-		SHOW_ERROR_AND_RETURN(elems);
+	    if(LOUD)
+		cout << fn->name << " " << fn->threshold << endl;
 
-	    fn->trackedFuncs.push_back(elems[1]);
 	}
 	else if(elems.size() != 0)
 	    SHOW_ERROR_AND_RETURN(elems);
@@ -736,13 +792,7 @@ INT32 Usage()
 	 << " more than 3 nanoseconds." << endl;
     cerr << "Valid units are: s, ms, us, ns." << endl;
     cerr << endl;
-    cerr << "The straggler definition may be optionally followed by one or more lines like this:" << endl;
-    cerr << endl;
-    cerr << "   * my_func1" << endl;
-    cerr << "   * my_func2" << endl;
-    cerr << endl;
-    cerr << "In this case, the straggler-catcher will track whether my_func1 and my_func2 were called "
-	"by the straggler function. " << endl;
+    
     return -1;
 }
 
@@ -754,6 +804,7 @@ INT32 Usage()
 
 int main(int argc, char *argv[])
 {
+
     // Initialize pin & symbol manager
     PIN_InitSymbols();
     if( PIN_Init(argc,argv) )
@@ -785,8 +836,11 @@ int main(int argc, char *argv[])
     /* Register Analysis routines to be called when a thread begins/ends */
     PIN_AddThreadStartFunction(ThreadStart, 0);
     PIN_AddThreadFiniFunction(ThreadFini, 0);
+    
+    /* Register the application-start function */
+    PIN_AddApplicationStartFunction(ApplicationStart, 0);
 
-    // Never returns
+    /* Never returns */
     PIN_StartProgram();
     
     return 0;
