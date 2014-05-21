@@ -96,18 +96,16 @@ typedef struct func_name
 {
     string name;
     UINT64 threshold;
-    struct func_name * next;
 } FuncName;
 
-FuncName * funcNameList = 0;
-
+vector<FuncName*> funcNameList;
 
 /* We will allocate an array with per-thread data assuming that we will have no more than
  * 64 threads. If we do have more than 64, we will reallocate the array to accommodate the
  * larger number. 
  */
-unsigned int threadArraySize = 32;
-unsigned int largestUnusedThreadID = 0;
+int threadArraySize = 32;
+int largestUnusedThreadID = 0;
 
 #define CACHE_LINE_SIZE 64
 #define STACK_LIMIT 8192
@@ -119,8 +117,11 @@ typedef struct thread_local_data
     char valid;
     char stackTrace[STACK_LIMIT];
     int stackBufPosition;
-    UINT8 padding[CACHE_LINE_SIZE-sizeof(UINT64)*2-sizeof(char)-sizeof(int)];
+    int droppedRecords;
+    UINT8 padding[CACHE_LINE_SIZE-sizeof(UINT64)*2-sizeof(char)-2*sizeof(int)];
 } ThrLocData; 
+
+int totalDroppedRecords = 0; 
 
 struct func_record;
 
@@ -133,35 +134,32 @@ typedef struct func_record
     ThrLocData *thrFuncRecords;
 } FuncRecord;
 
-/* This is an array of per-thread pointers to FuncRecord.
- * Whenever a thread enters one of the tracked function it sets
- * this pointer. This way we know when to record stack traces.
- * We only record the stack traces if we are within a tracked
- * function. 
- */
-FuncRecord **funcRecordArray;
-
-
 /* This where we store function records keyed by the function name. 
  * We are storing the function name twice. Get rid of the duplicate if
  * this becomes a problem. 
  */
-unordered_map<string, FuncRecord*> funcMap;
+FuncRecord **funcMap;
+int funcMapSize = 0;
+int smallestUnusedFuncMapSlot = 0;
 
 /* Useful for debugging. Must hold the lock when this function is called. */
 VOID printAllRecords()
 {
     cout << "---------------------------------------------" << endl;
+    
+    
 
-    for (auto& x: funcMap) {
-	std::cout << x.first << ": " << x.second << std::endl;
-	FuncRecord *fr = (FuncRecord *) x.second;
+    for (int i = 0; i < funcMapSize; i++) {
+	FuncRecord *fr = funcMap[i];
+
+	if(fr == 0)
+	    continue; 
 
 	cout << fr->name << ", thr:" <<  fr->latencyThreshold << 
 	    ", img: " << fr->image << hex << ", addr: " << fr->address << dec << endl;
 
 	if(fr->thrFuncRecords){
-	    UINT i;
+	    int i;
 	    
 	    for(i = 0; i < largestUnusedThreadID; i++)
 	    {
@@ -193,9 +191,9 @@ int allocMoreSpaceAndCopy()
 {
     unsigned int newsize = threadArraySize * 2;
 
-    for (auto& x: funcMap) 
-    {
-    	FuncRecord *fr = x.second;
+    for (int i = 0; i < funcMapSize; i++) {
+	FuncRecord *fr = funcMap[i];
+
 	assert(fr->thrFuncRecords);
 	ThrLocData *newArray;
 
@@ -223,7 +221,7 @@ int allocMoreSpaceAndCopy()
  */
 VOID markThreadRecValid(unsigned int threadid)
 {
-    assert(threadid < largestUnusedThreadID);
+    assert(threadid < (uint)largestUnusedThreadID);
     if(largestUnusedThreadID > threadArraySize)
     {
 	int err = allocMoreSpaceAndCopy();
@@ -236,9 +234,10 @@ VOID markThreadRecValid(unsigned int threadid)
 	}
     }
 
-    for (auto& x: funcMap) 
+
+    for (int i = 0; i < funcMapSize; i++) 
     {
-    	FuncRecord *fr = x.second;
+	FuncRecord *fr = funcMap[i];
 	fr->thrFuncRecords[threadid].valid = 1;
     }
 }
@@ -250,14 +249,13 @@ VOID markThreadRecValid(unsigned int threadid)
  */
 VOID markThreadRecInvalid(unsigned int threadid)
 {
-    assert(threadid < largestUnusedThreadID);
+    assert(threadid < (uint)largestUnusedThreadID);
 
-    for (auto& x: funcMap) 
-    {
-    	FuncRecord *fr = x.second;
+    for (int i = 0; i < funcMapSize; i++) {
+	FuncRecord *fr = funcMap[i];
 	assert(fr->thrFuncRecords);
-
 	fr->thrFuncRecords[threadid].valid = 0;
+	totalDroppedRecords += fr->thrFuncRecords[threadid].droppedRecords;
     }
 }
 
@@ -407,7 +405,9 @@ inline VOID writeStackRecord(FuncRecord *fr, char *rtnName, char *suffix)
 
     if(bufferCurPosition + newRecordLength > STACK_LIMIT)
     {
-	cerr << "About to overflow buffer. Dropping record " << endl;
+	if(LOUD)
+	    cerr << "About to overflow buffer. Dropping record " << endl;
+	fr->thrFuncRecords[threadid].droppedRecords++;
 	return;
     }
 
@@ -432,15 +432,24 @@ inline VOID recordStackTraceExit(FuncRecord *fr, char *rtnName)
  * Called before every function if we are recording stack traces
  * -- i.e., which functions were called inside the tracked function. 
  * Unfortunately, because we may track several routines, we are iterating
- * over tracked function records. If the performance overhead is huge, 
- * try switching to an array. 
+ * over all tracked function records. 
  */
 VOID stackTraceBefore(char *rtnName)
 {
     THREADID tid = PIN_ThreadId();
-    for (auto& x: funcMap) 
-    {
-	FuncRecord *fr = (FuncRecord *) x.second;
+
+    /* We are not holding the lock while iterating
+     * over the funcMap. It is possible that some null pointers
+     * are being replaced with non-null pointers as we read them. 
+     * We assume that reading a pointer from the array is atomic
+     * on most modern architectures -- can be done in a single 
+     * instruction. If this is not the case, then this code may 
+     * race in the very beginning when we are still loading images
+     * and looking for routines to instrument. 
+     */
+
+    for (int i = 0; i < funcMapSize; i++) {
+	FuncRecord *fr = funcMap[i];
 
 	/* fr->thrFuncRecords pointer must be valid and the
 	 * record associated with this thread ID must be valid.
@@ -457,9 +466,12 @@ VOID stackTraceBefore(char *rtnName)
 VOID stackTraceAfter(char *rtnName)
 {
     THREADID tid = PIN_ThreadId();
-    for (auto& x: funcMap) 
-    {
-	FuncRecord *fr = (FuncRecord *) x.second;
+
+    /* Map access may race. See comment for
+     * stackTraceBefore.
+     */
+    for (int i = 0; i < funcMapSize; i++) {
+	FuncRecord *fr = funcMap[i];
 
 	/* fr->thrFuncRecords pointer must be valid and the
 	 * record associated with this thread ID must be valid.
@@ -497,10 +509,8 @@ VOID stragglerCatcherThread(void *arg)
     {
 	PIN_GetLock(&lock, PIN_ThreadId());
 
-	for (auto& x: funcMap) {
-
-	    FuncRecord *fr = (FuncRecord *) x.second;
-	    UINT i;
+	for (int i = 0; i < funcMapSize; i++) {
+	    FuncRecord *fr = funcMap[i];
 	
 	    for(i = 0; i < largestUnusedThreadID; i++)
 	    {
@@ -520,6 +530,11 @@ VOID stragglerCatcherThread(void *arg)
     }
 
     cout << "Straggler catcher thread is exiting..." << endl;
+    if(totalDroppedRecords > 0)
+    {
+	cout << "Dropped " << totalDroppedRecords << " stack trace records due to insufficient "
+	     << "stack buffer size (" << STACK_LIMIT << ")"<< endl;
+    }
 }
 
 VOID ApplicationStart(VOID *v)
@@ -588,13 +603,15 @@ VOID Image(IMG img, VOID *v)
     /* Go over all the routines we are instrumenting and insert the
      * instrumentation.
      */
-    for (FuncName* fn = funcNameList; fn; fn = fn->next)
+    for (FuncName* fn: funcNameList)
     { 
 	THREADID threadid;
 	RTN rtn = RTN_FindByName(img, fn->name.c_str());
 
 	if (RTN_Valid(rtn))
 	{
+	    threadid = PIN_ThreadId();
+	    PIN_GetLock(&lock, threadid+1);
 	    cout << "Procedure " << fn->name << " located." << endl;
 
 	    // Allocate a record for this routine
@@ -619,9 +636,8 @@ VOID Image(IMG img, VOID *v)
 	     * another chance to do so -- the ThreadStart routine where this is
 	     * normally done has already run.
 	     */
-	    threadid = PIN_ThreadId();
 	    assert(threadid != INVALID_THREADID);
-	    assert(threadid < threadArraySize);
+	    assert(threadid < (uint)threadArraySize);
 
 	    fr->thrFuncRecords[threadid].valid = 1;
 
@@ -633,11 +649,9 @@ VOID Image(IMG img, VOID *v)
 			   IARG_PTR, fr, IARG_END);
 	    RTN_Close(rtn);
 
-	    // Add to the map of routines
-	    pair<string, FuncRecord*> record(fr->name, fr);
-
-	    PIN_GetLock(&lock, threadid+1);
-	    funcMap.insert(record);
+	    /* Add to the map of routines */
+	    assert(smallestUnusedFuncMapSlot < funcMapSize);
+	    funcMap[smallestUnusedFuncMapSlot++] = fr;
 	    PIN_ReleaseLock(&lock);
 
 
@@ -769,8 +783,8 @@ int buildFuncList(ifstream& f)
 	    if(fn == NULL)
 		return -1;
 
-	    fn->next = funcNameList;
-	    funcNameList = fn;
+	    funcNameList.push_back(fn);
+	    
 
 	    if(LOUD)
 		cout << fn->name << " " << fn->threshold << endl;
@@ -780,6 +794,16 @@ int buildFuncList(ifstream& f)
 	    SHOW_ERROR_AND_RETURN(elems);
 	
     }
+
+    /* At this point we know how many functions we are going to instrument
+     * and hence how many function records, at most, we will need. Let's
+     * allocate space for them, so the container remains fixed in the future
+     * and we can allow accessing the pointers within it without locks to
+     * avoid synchronization in a critical path.
+     */
+    funcMapSize = funcNameList.size();
+    funcMap = new FuncRecord*[funcMapSize];
+    memset((void*)funcMap, 0, funcMapSize * sizeof(FuncRecord*)); 
 
     return 0;
 
