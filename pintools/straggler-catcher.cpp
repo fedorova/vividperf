@@ -49,6 +49,9 @@ END_LEGAL */
 #include <unordered_map>
 #include <sstream> 
 #include "pin.H"
+#include "instlib.H"
+
+using namespace INSTLIB;
 
 /* ===================================================================== */
 /* Global Variables */
@@ -318,8 +321,18 @@ inline BOOL catchStraggler(FuncRecord *fr, THREADID threadid)
     UINT64 elapsedTime, timeNow;
     BOOL caught = FALSE;
 
+   /* The variable timeAtLastEntry may be concurrently
+    * modified by a worker thread and read by the straggler catcher thread. 
+    * We are not protecting it with a lock for performance considerations.
+    * If we did, every check for a straggler would be serialized, and this
+    * can happen very often.  
+    * That might result in a few false positives. We are willing to make
+    * that sacrifice in order to avoid locking. Locking this variable can
+    * reduce performance 1000x on some tests.
+    */
     if(fr->thrFuncRecords[threadid].timeAtLastEntry == 0)
 	return FALSE;
+
 
     clock_gettime(CLOCK_MONOTONIC_RAW, &timeAfter);
     timeNow = (timeAfter.tv_sec * BILLION + timeAfter.tv_nsec);
@@ -332,6 +345,8 @@ inline BOOL catchStraggler(FuncRecord *fr, THREADID threadid)
      */
     if(elapsedTime == timeNow)
 	return FALSE;
+
+    PIN_GetLock(&lock, PIN_ThreadId());
 
     if(LOUD)
 	cout << fr->name << "  took " << elapsedTime << " ns." << endl; 
@@ -347,9 +362,12 @@ inline BOOL catchStraggler(FuncRecord *fr, THREADID threadid)
 	else
 	    stragglerCaught(fr, threadid, 
 			    fr->thrFuncRecords[threadid].timeAtLastEntry, timeNow, 
-			    (char*) "<no stacks traced>");
+			    (char*) "'<stack tracing not enabled (use -trace option)>'");
 	caught = TRUE;
     }
+
+    PIN_ReleaseLock(&lock);
+
     return caught;
 }
 
@@ -357,8 +375,6 @@ VOID callBefore(FuncRecord *fr)
 {
     timespec ts;
     THREADID threadid = PIN_ThreadId();
-
-    assert(fr->thrFuncRecords[threadid].valid);
 
     clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     fr->thrFuncRecords[threadid].timeAtLastEntry = ts.tv_sec * BILLION + ts.tv_nsec;
@@ -370,11 +386,7 @@ VOID callAfter(FuncRecord *fr)
 
     THREADID threadid = PIN_ThreadId();
 
-    assert(fr->thrFuncRecords[threadid].valid);
-
-    PIN_GetLock(&lock, PIN_ThreadId());
     catchStraggler(fr, threadid);
-    PIN_ReleaseLock(&lock);
 
     fr->thrFuncRecords[threadid].invCount++;
     fr->thrFuncRecords[threadid].timeAtLastEntry = 0;
@@ -465,10 +477,7 @@ VOID stackTraceAfter(char *rtnName)
 
 /* Should be used by the straggler-catcher thread. 
  * This fuction goes over all function records and checks if
- * there are any stragglers. The timeAtLastEntry may be concurrently
- * modified by worker threads -- we are not protecting it with a lock. 
- * That might result in a few false positives. We are willing to make
- * that sacrifice in order to avoid locking. 
+ * there are any stragglers. 
  *
  * The thread does acquire a lock to avoid race conditions where we 
  * are modifying the thread-record structure in the application thread
@@ -497,7 +506,11 @@ VOID stragglerCatcherThread(void *arg)
 	    {
 		ThrLocData *tld = &(fr->thrFuncRecords[i]);
 		if(tld->valid)
+		{
+		    PIN_ReleaseLock(&lock);
 		    catchStraggler(fr, i);
+		    PIN_GetLock(&lock, PIN_ThreadId());
+		}
 	    }
 	} 
 	PIN_ReleaseLock(&lock);
@@ -802,6 +815,8 @@ INT32 Usage()
 /* Main                                                                  */
 /* ===================================================================== */
 
+FILTER filter;
+
 int main(int argc, char *argv[])
 {
 
@@ -839,6 +854,8 @@ int main(int argc, char *argv[])
     
     /* Register the application-start function */
     PIN_AddApplicationStartFunction(ApplicationStart, 0);
+
+    filter.Activate();
 
     /* Never returns */
     PIN_StartProgram();
