@@ -12,6 +12,84 @@ Tool descriptions are provided below. The name in paretheses is the name of the 
 
 
 Tools:
+
+=====================================================
+memtracker.so (memtracker.sh, memtracker-with-gdb.sh)
+=====================================================
+
+This tool tracks memory accesses and memory allocations. It prints out a trace of allocation and access records. Here is an example of what you might see:
+
+alloc: 0x00007f3a858d1c51 my_alloc 6 0x00007f3a7c000990 632 1 /cs/systems/home/fedorova/Work/my_example.c:380 BT_NODE * node
+
+write: 6 0x00007f3a80d70960 8
+write: 6 0x00007f3a80d70958 8
+write: 6 0x00007f3a80d70950 8
+write: 6 0x00007f3a80d70948 8
+
+An allocation record gives us:
+* The code address where the allocation was performed
+* The name of the allocation function
+* The ID of the thread that performed the allocation
+* The allocated address
+* The size of the allocation
+* The number of allocated objects (for functions like calloc)
+* The location in the source code
+* Variable type (optional)
+* Variable name
+
+Allocation records are printed only if the debug information is available. 
+
+The access record gives us:
+* The type of an access (read or write)
+* The ID of the thread that performed the access
+* The address that was accessed
+* The size of the access
+
+HOW TO USE THE TOOL:
+
+To see how to launch the tool, take a look at the script memtracker.sh for an example.
+
+If you want to know the types of allocated variables, you need to run with gdb and use the script memtracker-with-gdb.sh for an example. 
+
+HOW THE TOOL OBTAINS VARIABLE NAMES AND TYPES:
+
+We get the name of the allocated variable by parsing the source file. The source location of the call to the alloc function can be obtained from within a Pintool. In most cases, the name of the variable is sufficient to identify the allocated object, because most programmers give their variables intuitive names. For instance, if you called a variable "node", you can guess that it is of type "BT_NODE", if this type is defined in your program. However, if desired, we can also obtain variable types. 
+
+The way we get the type of the allocated variable is kind of arcane and ugly. I think this needs to be redesigned, but I do not have time, so here it is. Basically, the most quick and dirty way to implement this was to get the type via gdb, by using it's "whatis" command. We use gdb as follows:
+
+(See memtracker-with-gdb.sh for an actual example.)
+
+1) Start a gdb session providing the application binary as the argument and set it up so it reads its command from a file gdb-cmd.txt.
+2) Concurrently have the memtracker launch the application using the "appdebug" mode, that is,
+allowing gdb to attach to the application that is running inder a pintool.
+3) Pipe the output from memtracker to the python script called memtracker-gdb-driver.py: let us call
+it simply the GDB driver.
+4) The GDB driver will take gdb commands from the tool's output (anything prefixed with "gdb:",
+plus the initial pintool message specifying on which port to attach to the application)
+and will write them to gdb-cmd.txt.
+5) The GDB session will take the commands and execute them. 
+
+We set a gdb breakpoint before every memory allocation function. Once that breakpoint is hit, we parse the source to find out the name of the variable, let's call it "varname", and then pass to gdb the command:
+
+   whatis varname
+
+Gdb then outputs the type of the variable to the file gdb-out.txt.
+If the tool already asked gdb for a variable type, it doesn't ask it again, because we already have that information. 
+
+At the end of the run, the script memtracker-process-raw.py takes the files log.txt (which is where memtracker prints allocation records -- that file contains everything except variable types) and gdb-out.txt (which contains variable types) and merges them into a unified data structure. 
+
+So you can see how arcane this is. Doing this dance with gdb is also a huge hit on the tool's performance. A much better way would be to learn the variable type by doing more parsing on the source file, but I do not plan to do this, because I believe that in most cases knowing variable type does not buy us much once we know the variable name. Plus, I don't have time. So there you have it. 
+
+IMPORTANT FEATURES:
+
+Apart from the gdb madness, the tool has some nice features enabling it to work with real productioncode. 
+
+* It does not require changes to the source code of your program. 
+* It can track alternative alloc functions (not just malloc). In the input file (default is alloc.in) you specify the names of the allocation functions you want to track and their prototypes. So if your allocation function allocates multiple items at once (like calloc) or puts the allocated address in the in-out pointer argument -- memtracker supports that. Read an example file alloc.in to understand how to specify the allocation functions. 
+
+Sometimes your alloc function might be wrapped in a macro, possibly giving this function an alternative prototype. You need to specify all such alternative prototypes for a function in alloc.in, otherwise memtracker will not be able to parse the variable name in cases where the allocation function is invoked via a macro.
+
+
 ==================
 null.so (null.sh)
 ==================
