@@ -1,0 +1,30 @@
+Starting 1 populate thread(s) for 10000000 items
+555048 populate inserts (555048 of 10000000) in 5 secs (5 total secs)
+562848 populate inserts (1117896 of 10000000) in 5 secs (10 total secs)
+600299 populate inserts (1718195 of 10000000) in 5 secs (15 total secs)
+595851 populate inserts (2314046 of 10000000) in 5 secs (20 total secs)
+588902 populate inserts (2902948 of 10000000) in 5 secs (25 total secs)
+593996 populate inserts (3496944 of 10000000) in 5 secs (30 total secs)
+654144 populate inserts (4151088 of 10000000) in 5 secs (35 total secs)
+552871 populate inserts (4703959 of 10000000) in 5 secs (40 total secs)
+560417 populate inserts (5264376 of 10000000) in 5 secs (45 total secs)
+558024 populate inserts (5822400 of 10000000) in 5 secs (50 total secs)
+381631 populate inserts (6204031 of 10000000) in 5 secs (55 total secs)
+573569 populate inserts (6777600 of 10000000) in 5 secs (60 total secs)
+796934 populate inserts (7574534 of 10000000) in 5 secs (65 total secs)
+580723 populate inserts (8155257 of 10000000) in 5 secs (70 total secs)
+587031 populate inserts (8742288 of 10000000) in 5 secs (75 total secs)
+603531 populate inserts (9345819 of 10000000) in 5 secs (80 total secs)
+595564 populate inserts (9941383 of 10000000) in 5 secs (85 total secs)
+Finished load of 10000000 items
+Load time: 158.40
+load ops/sec: 63131.58
+Starting workload #1: 4 threads, inserts=0, reads=1, updates=0
+12434 reads, 0 inserts, 0 updates, 0 checkpoints in 5 secs (90 total secs)
+23100 reads, 0 inserts, 0 updates, 0 checkpoints in 5 secs (95 total secs)
+24517 reads, 0 inserts, 0 updates, 0 checkpoints in 5 secs (100 total secs)
+Executed 84776 read operations (100%) 4238 ops/sec
+Executed 0 insert operations (0%) 0 ops/sec
+Executed 0 update operations (0%) 0 ops/sec
+Executed 0 checkpoint operations
+Run completed: 20 seconds

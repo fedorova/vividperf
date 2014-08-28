@@ -1,0 +1,15 @@
+# A function followed by one or more
+# lines beginning with a # means that
+# this function might be wrapped
+# in a macro with a different signature
+# than the function itself. 
+# We need to keep track of this for
+# parsing the argument types. 
+#
+# func                number   size   addr
+#
+__wt_calloc              1       2     3 
+!__wt_calloc_def         1      -1     2
+!__wt_block_size_alloc  -1      -1     1 
+#malloc                 -1       0    -1
+__wt_realloc            -1       2     3

@@ -11,7 +11,7 @@
 # Tools targets
 #
 ##############################################################
-TEST_TOOL_ROOTS := null procinstr showprocs-dynamic showprocs-static straggler-catcher
+TEST_TOOL_ROOTS := memtracker null procinstr showprocs-dynamic showprocs-static straggler-catcher
 
 TOOL_LIBS += -lrt
 TOOL_CXXFLAGS += -std=c++0x -g -Wno-error=format-contains-nul -Wno-format-contains-nul -Wno-write-strings
