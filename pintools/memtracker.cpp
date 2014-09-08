@@ -48,7 +48,6 @@ using namespace std;
 
 
 PIN_LOCK lock;
-ofstream traceFile;
 bool LOUD = false;
 bool go = false;
 
@@ -57,9 +56,6 @@ bool go = false;
 /* ===================================================================== */
 /* Commandline Switches */
 /* ===================================================================== */
-
-KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
-    "o", "memtracker.out", "specify trace file name");
 
 KNOB<string> KnobTrackedFuncsFile(KNOB_MODE_WRITEONCE, "pintool",
     "f", "memtracker.in", "specify filename with procedures "
@@ -402,7 +398,8 @@ bool fileError(ifstream &sourceFile, string file, int line)
 	return false;
 }
 
-/* We need to find the function name and make
+/* 
+ * We need to find the function name and make
  * sure that it's followed either by a newline or
  * space or "(".
  */
@@ -420,6 +417,74 @@ bool functionFound(string line, string func, size_t *pos)
 	return false;
     }
 }
+
+bool
+validCharInName(char c)
+{
+    if(c == '_')
+	return true;
+
+    return isalnum(c);
+}
+    
+  
+
+/*
+ * We are given a line and the position where the function
+ * name begins. We have to backtrack to find the name of the
+ * variable to which we assign the return value of that function.
+ * We return an empty string if no such name is found. 
+ *
+ * If the function invocation is broken across multiple lines and 
+ * we have not found the name of the variable on the same line
+ * as the function name, we we given one of the previous lines
+ * in the source file, were we search for the variable. The
+ * argument pos, in that case, points to the end of the line.
+ * 
+ * The argument previouslyFoundEquals tells us whether we found the
+ * equals sign on one of the lines we previously searched. "Equals"
+ * is important, because is it a delimiter between the return variable
+ * name and the function name. 
+ */
+string
+findReturnVar(string line, size_t pos, bool *previouslyFoundEquals)
+{
+    const char *cbuf;
+    bool foundVarEnd = false;
+    bool foundEquals = *previouslyFoundEquals;
+    size_t posAtVarEnd = 0;
+
+
+    if(pos == 0)
+	return "";
+
+    assert(pos < line.length());
+
+    cbuf = line.c_str();
+
+    while(pos > 0)
+    {
+	if(cbuf[pos] == '=')
+	{
+	    *previouslyFoundEquals = foundEquals  = true;
+	}
+	else if(foundEquals && !foundVarEnd && !isspace(cbuf[pos]))
+	{
+	    foundVarEnd = true;
+	    posAtVarEnd = pos;
+	}
+	else if(foundEquals && foundVarEnd && 
+		!validCharInName(cbuf[pos]))
+	{
+	    pos++;
+	    return line.substr(pos, posAtVarEnd-pos+1);
+	}
+	pos--;
+    }
+    return "";
+}
+    
+
 
 /*
  * This routine will parse the file and return to us the
@@ -440,39 +505,66 @@ string findAllocVarName(string file, int line, string func, int arg,
 			vector<FuncProto*>otherFuncProto)
 {
     ifstream sourceFile;
-    string lineString;
+    string lineString, var;
     size_t pos;
     int filepos = line;
+
+
+#define MAXLINES 5
+    string lineBuffer[MAXLINES];
+    unsigned int bufferPos = -1;
 
     sourceFile.open(file.c_str());
     if(!sourceFile.is_open())
     {
 	cerr << "Failed to open file " << file << endl;
-	cerr << "Cannot parse allocated type " << endl;
-	return "";
+	cerr << "Cannot parse the name of the allocated variable. " << endl;
+	
+	var = "";
+	goto done;
     }
 
+    /* Scroll through the file to the
+     * source line of interest. Remember the MAXLINES last lines
+     * read in a buffer. We might need to scroll back a bit
+     * later as we look for a variable name.
+     */
     while(filepos-- > 0)
     {
 	getline(sourceFile, lineString);
 	if(fileError(sourceFile, file, line))
 	   return "";	   
+	lineBuffer[++bufferPos%MAXLINES].assign(lineString);
     }
 
-#if 0
-    /* Ok, here is the line we want to parse */
-    cout << "Will parse: "<< endl;
-    cout << lineString << endl;
-#endif
 
-    /* First let's find the alloc function name on that line.
-     * We need to figure out whether this is the original 
-     * function definition or one of its "other" prototypes, 
-     * because this will determine which argument (or return value)
-     * holds the allocated address.
+    /* 
+     * Ok, so we are now at the source line where, according to 
+     * debugging symbols, we have the alloc function. 
+     * Let's attempt to find the alloc function name on that line.
+     * We may not suceed for two reasons. 
+     *
+     * First, the alloc function could be called via a macro with a
+     * different name (and also possibly with a different prototype) 
+     * than the function itself. 
+     * In that case, we will be pointed to
+     * the source file/line where we call the macro. So let's search
+     * through macro wrappers for that function to find whether
+     * one of the macros' names is present on this line. 
+     *
+     * The second reason we may fail is if the function invocation is
+     * spread across multiple lines, as in:
+     *
+     * myval =
+     *         malloc(size);
+     *
+     * So we are also going to read ahead a MAXLINES lines in the 
+     * file to see if we can find our function further down in the
+     * file.  
      */
-    if(!functionFound(lineString, func, &pos))
+    while(!functionFound(lineString, func, &pos))
     {
+	bool found = false;
 	/* Let's go through alternative function
 	 * prototypes and find it.
 	 */
@@ -481,20 +573,30 @@ string findAllocVarName(string file, int line, string func, int arg,
 	    if(functionFound(lineString, fp->name, &pos))
 	    {
 		arg = fp->retaddr;
-#if 0
-		cout << "Detected alternate prototype with name "
-		     << fp->name << ", arg is: " << arg << endl;
-#endif
+		found = true;
 		break;
 	    }
 	}
+	if(found)
+	    break;
+	else
+	{
+	    /* Read the next line and see to we can
+	     * find the function there */
+	    getline(sourceFile, lineString);
+	    if(fileError(sourceFile, file, line))
+		return "";	   
+	    lineBuffer[++bufferPos%MAXLINES].assign(lineString);
+	}
     }
+
 
     if(pos == string::npos)
     {
 	cerr << "Cannot find func name " << func << 
 	    " on line " << line << " in file " << file << endl;
-	return "";
+	var = "";
+	goto done;
     }
     
     /* If the allocated variable is an argument to the function 
@@ -503,8 +605,48 @@ string findAllocVarName(string file, int line, string func, int arg,
      */
     if(arg == -1) /* Variable is the return value. Back off */
     {
-	/* TODO */
-	cerr << "Bumped into unimplemented functionality " << endl;
+	/* We kept MAXLINES last lines that we read in a line
+	 * buffer in case the name of the variable holding the
+	 * return pointer, which is what we are after, and the
+	 * function are not on the same line, as in:
+	 * 
+	 * my_var = 
+	 *         malloc(size);
+	 *
+	 * If the programmer wrote some crazy code that the
+	 * variable name and the function name are separated
+	 * by more than MAXLINES lines, then we won't be able
+	 * to find the variable name. In this case we proceed
+	 * running the tool, we just won't report the variable
+	 * name for that allocation.
+	 */
+	bool foundEquals = false;
+
+	for(int i = 0; i < MAXLINES; i++)
+	{
+	    string curline = lineBuffer[(bufferPos-i) % MAXLINES];
+
+	    if(curline.length() == 0)
+		continue;
+
+	    /* After searching for a function name above, pos is
+	     * set at the start of that function. If we are backing
+	     * up in our buffer in search of the variable, we 
+	     * set the position to the end of the line, because we
+	     * will be stepping back along the line in search 
+	     * of the variable name.
+	     */
+	    if(i > 0)
+		pos = curline.length() - 1;
+
+	    var = findReturnVar(curline, pos, &foundEquals);
+	    if(var.length() > 0)
+	    {
+		break;
+		trimVarName(var);
+	    }
+	}
+	
     }
     else
     {
@@ -520,7 +662,10 @@ string findAllocVarName(string file, int line, string func, int arg,
 	    getline(sourceFile, lineString);
 	    pos = 0;
 	    if(fileError(sourceFile, file, line))
-		return "";
+	    {
+		var = "";
+		goto done;
+	    }
 	}
 	
 	/* Ok, now from the opening bracket, we need to skip
@@ -528,9 +673,6 @@ string findAllocVarName(string file, int line, string func, int arg,
 	 * arg 0. So skip as many commas as necessary
 	 */
 	int commasToSkip = arg;
-#if 0
-	cout << "Skipping " << commasToSkip << " commas " << endl;
-#endif
 	while(commasToSkip-- > 0)
 	{
 	    /* Here again we may have to skip lines, because
@@ -542,15 +684,11 @@ string findAllocVarName(string file, int line, string func, int arg,
 		getline(sourceFile, lineString);
 		pos = 0;
 		if(fileError(sourceFile, file, line))
-		    return "";
-#if 0
-		cout << "Skipped line to:" << endl;
-		cout << lineString << endl;
-#endif
+		{
+		    var = "";
+		    goto done;
+		}
 	    }
-#if 0
-	    cout << commasToSkip << " commas left " << endl;
-#endif
 	}
 	/* We've skipped to the last comma, now let's skip
 	 * over it.
@@ -570,7 +708,10 @@ string findAllocVarName(string file, int line, string func, int arg,
 	{
 	    getline(sourceFile, lineString);
 	    if(fileError(sourceFile, file, line))
-		return "";
+	    {
+		var = "";
+		goto done;
+	    }
 
 	    pos = 0;
 	    endpos = lineString.length();
@@ -583,7 +724,10 @@ string findAllocVarName(string file, int line, string func, int arg,
 	    {
 		getline(sourceFile, lineString);
 		if(fileError(sourceFile, file, line))
-		    return "";
+		{
+		    var = "";
+		    goto done;
+		}
 
 		pos = 0;
 		endpos = lineString.length();
@@ -592,23 +736,16 @@ string findAllocVarName(string file, int line, string func, int arg,
 		pos++;
 	}
 
-#if 0
-	cout << lineString ;
-	cout << "Pos is: " << pos << endl;
-	cout << "Found variable in substring: " << lineString.substr(pos)
-	     << endl;
-#endif
+	/* Let's trim away all foreign characters from the line
+	 * so all we are left with is the name of the variable 
+	 */
+	var = lineString.substr(pos);
+	trimVarName(var);
     }
 
-    /* Let's trim away all foreign characters from the line
-     * so all we are left with is the name of the variable 
-     */
-    string var = lineString.substr(pos);
-    trimVarName(var);
-    
     if(LOUD)
 	cout << "Var name is: " << var << endl;
-
+done:
     sourceFile.close();
     return var;
 }
@@ -1085,7 +1222,6 @@ VOID ThreadStart(THREADID threadid, CONTEXT *ctxt, INT32 flags, VOID *v)
 VOID Fini(INT32 code, VOID *v)
 {
     cout << "PR DONE" << endl;
-    traceFile.close();
 }
 
 
@@ -1103,7 +1239,6 @@ int main(int argc, char *argv[])
         return Usage();
     }    
 
-    traceFile.open(KnobOutputFile.Value().c_str());
 
     parseFunctionList(KnobTrackedFuncsFile.Value().c_str(), TrackedFuncsList);
     parseFunctionList(KnobAllocFuncsFile.Value().c_str(), AllocFuncsList);
