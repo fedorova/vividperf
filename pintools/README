@@ -51,6 +51,12 @@ To see how to launch the tool, take a look at the script memtracker.sh for an ex
 
 If you want to know the types of allocated variables, you need to run with gdb and use the script memtracker-with-gdb.sh for an example. 
 
+The tool assumes that the user provides two input files: alloc.in and memtracker.in. These are the file names assumed by default, and their assumed location is the same directory where the tool is invoked. 
+
+alloc.in provides a list of alloc functions that you want to track. See a sample alloc.in in this repository (scripts directory) for the explanation of the expected format. 
+
+The other file, memtracker.in, tells the tool the names of the functions in which you want to track the memory accesses. This is useful if you do not want to trace the entire program, but isolate your analysis to a problematic function (or functions). See a sample memtracker.in in this repository (scripts directory) for the explanation of the expected format. 
+
 HOW THE TOOL OBTAINS VARIABLE NAMES AND TYPES:
 
 We get the name of the allocated variable by parsing the source file. The source location of the call to the alloc function can be obtained from within a Pintool. In most cases, the name of the variable is sufficient to identify the allocated object, because most programmers give their variables intuitive names. For instance, if you called a variable "node", you can guess that it is of type "BT_NODE", if this type is defined in your program. However, if desired, we can also obtain variable types. 
