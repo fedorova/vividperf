@@ -21,10 +21,10 @@ This tool tracks memory accesses and memory allocations. It prints out a trace o
 
 alloc: 0x00007f3a858d1c51 my_alloc 6 0x00007f3a7c000990 632 1 /cs/systems/home/fedorova/Work/my_example.c:380 BT_NODE * node
 
-write: 6 0x00007f3a80d70960 8
-write: 6 0x00007f3a80d70958 8
-write: 6 0x00007f3a80d70950 8
-write: 6 0x00007f3a80d70948 8
+write: 6 0x00007f3a80d70960 8 main
+write: 6 0x00007f3a80d70958 8 main
+write: 6 0x00007f3a80d70950 8 main
+write: 6 0x00007f3a80d70948 8 main
 
 An allocation record gives us:
 * The code address where the allocation was performed
@@ -44,6 +44,7 @@ The access record gives us:
 * The ID of the thread that performed the access
 * The address that was accessed
 * The size of the access
+* The name of the function that performed the access.
 
 HOW TO USE THE TOOL:
 
@@ -55,7 +56,7 @@ The tool assumes that the user provides two input files: alloc.in and memtracker
 
 alloc.in provides a list of alloc functions that you want to track. See a sample alloc.in in this repository (scripts directory) for the explanation of the expected format. 
 
-The other file, memtracker.in, tells the tool the names of the functions in which you want to track the memory accesses. This is useful if you do not want to trace the entire program, but isolate your analysis to a problematic function (or functions). See a sample memtracker.in in this repository (scripts directory) for the explanation of the expected format. 
+The other file, memtracker.in, tells the tool the names of the functions in which you want to track the memory accesses. If you want to track everything, this file needs to contain a line with a '*' on it and nothing else. If you do not want to trace the entire program, but isolate your analysis to a problematic function (or functions), specify the function names you want to track, one per line. Lines starting with a '#' are ignored, so you can add comments on lines prefixed with a '#'.  See a sample memtracker.in in this repository (scripts directory) for the explanation of the expected format. 
 
 HOW THE TOOL OBTAINS VARIABLE NAMES AND TYPES:
 

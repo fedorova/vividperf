@@ -50,6 +50,7 @@ using namespace std;
 PIN_LOCK lock;
 bool LOUD = false;
 bool go = false;
+bool selectiveInstrumentation = false;
 
 #define BITS_PER_BYTE 8
 
@@ -58,12 +59,15 @@ bool go = false;
 /* ===================================================================== */
 
 KNOB<string> KnobTrackedFuncsFile(KNOB_MODE_WRITEONCE, "pintool",
-    "f", "memtracker.in", "specify filename with procedures "
-			   "where you want to track memory accesses");
+    "f", "memtracker.in", "Specify the name of the file with procedures "
+			   "where you want to track memory accesses. The file "
+			   "must contain a single '*' if you want to track "
+                           "all procedures.");
 
 KNOB<string> KnobAllocFuncsFile(KNOB_MODE_WRITEONCE, "pintool",
-    "a", "alloc.in", "specify filename with procedures performing "
-			   "memory allocations");
+				"a", "alloc.in", "Specify the  name of the file "
+				" with procedures performing "
+				"memory allocations");
 
 KNOB<int> KnobAppPtrSize(KNOB_MODE_WRITEONCE, "pintool",
 				"p", "64", "application pointer size in bits (default is 64)");
@@ -380,6 +384,21 @@ const char * StripPath(const char * path)
 }
 
 #define BILLION 1000000000
+
+char *allocFunctionName(RTN rtn)
+{
+    /* Allocate space to hold the name for this routine.
+     * We never free this space, because we need to keep
+     * it until the end of the program. So these strings
+     * will be freed when we exit the tool. 
+     */
+    char *rtnName = new char[RTN_Name(rtn).length()+1];
+    memset(rtnName, 0, RTN_Name(rtn).length()+1);
+    strncpy(rtnName, RTN_Name(rtn).c_str(), RTN_Name(rtn).length());
+
+    return rtnName;
+}
+
 
 
 bool fileError(ifstream &sourceFile, string file, int line)
@@ -755,6 +774,23 @@ done:
 /* Analysis routines                                                     */
 /* ===================================================================== */
 
+VOID callBeforeFunction(VOID *name)
+{
+    /* Don't track anything until we hit main() */
+    if(!go)
+	return;
+    cout << "function-begin: " << PIN_ThreadId() << " " << (char*) name << endl;
+
+}
+
+VOID callAfterFunction(VOID *name)
+{
+    /* Don't track anything until we hit main() */
+    if(!go)
+	return;
+    cout << "function-end: " << PIN_ThreadId() << " " << (char*) name << endl;
+
+}
 
 VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number, 
 		     ADDRINT size, ADDRINT retptr)
@@ -958,25 +994,27 @@ VOID callBeforeMain()
  */
 
 // Print a memory write record
-VOID recordMemoryRead(ADDRINT addr, UINT32 size)
+VOID recordMemoryRead(ADDRINT addr, UINT32 size, VOID *rtnName)
 {
     THREADID threadid  = PIN_ThreadId();
     PIN_GetLock(&lock, threadid+1);
 
     cout << "read: " << threadid << " 0x" << hex << setw(16) 
-	 << setfill('0') << addr << dec << " " << size << endl;
+	 << setfill('0') << addr << dec << " " << size << " " 
+	 << (char*) rtnName << endl;
 
     PIN_ReleaseLock(&lock);
 }
 
 // Print a memory write record
-VOID recordMemoryWrite(ADDRINT addr, UINT32 size)
+VOID recordMemoryWrite(ADDRINT addr, UINT32 size, VOID *rtnName)
 {
     THREADID threadid  = PIN_ThreadId();
     PIN_GetLock(&lock, threadid+1);
 
     cout << "write: " << threadid << " 0x" << hex << setw(16) 
-	 << setfill('0') << addr << dec << " " << size << endl;
+	 << setfill('0') << addr << dec << " " << size << " " 
+	 << (char*) rtnName << endl;
 
     PIN_ReleaseLock(&lock);
 }
@@ -985,6 +1023,45 @@ VOID recordMemoryWrite(ADDRINT addr, UINT32 size)
 /* Instrumentation routines                                              */
 /* ===================================================================== */
    
+VOID instrumentRoutine(RTN rtn, VOID * unused)
+{
+    RTN_Open(rtn);
+	    
+    char *rtnName = allocFunctionName(rtn);
+
+    /* Instrument entry and exit to the routine to report
+     * function-begin and function-end events.
+     */
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBeforeFunction,
+		   IARG_PTR, rtnName, IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)callAfterFunction,
+		   IARG_PTR, rtnName, IARG_END);
+
+
+    /* Insert instrumentation for each instruction in the routine */
+    for(INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
+    {
+	if (INS_IsMemoryWrite(ins))
+	{
+	    INS_InsertPredicatedCall(ins, IPOINT_BEFORE, 
+				     (AFUNPTR)recordMemoryWrite,
+				     IARG_MEMORYWRITE_EA, 
+				     IARG_MEMORYWRITE_SIZE, 
+				     IARG_PTR, rtnName, IARG_END);
+	}
+	if (INS_IsMemoryRead(ins))
+	{
+	    INS_InsertPredicatedCall(ins, IPOINT_BEFORE, 
+				     (AFUNPTR)recordMemoryRead,
+				     IARG_MEMORYREAD_EA, 
+				     IARG_MEMORYREAD_SIZE, 
+				     IARG_PTR, rtnName, IARG_END);
+	}
+    }
+
+    RTN_Close(rtn);
+}
+
 VOID Image(IMG img, VOID *v)
 {
     static int lastBreakPointID = 1;
@@ -1105,55 +1182,39 @@ VOID Image(IMG img, VOID *v)
     /* Now let's go over all the routines where we want to track 
      * the actual memory accesses and instrument them.
      */
-    for (string fname: TrackedFuncsList)
+    if(selectiveInstrumentation)
     {
-	THREADID threadid;
-	RTN rtn = RTN_FindByName(img, fname.c_str());
-
-	if (!RTN_Valid(rtn))
-	    continue;
-
-	threadid = PIN_ThreadId();
-	PIN_GetLock(&lock, threadid+1);
-	cout << "Procedure " << fname << " located." << endl;
-
-	RTN_Open(rtn);
-
-	/* Insert instrumentation for each instruction in the routine */
-	for(INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
+	for (string fname: TrackedFuncsList)
 	{
-	    if (INS_IsMemoryWrite(ins))
-	    {
-		INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)recordMemoryWrite,
-			       IARG_MEMORYWRITE_EA, 
-			       IARG_MEMORYWRITE_SIZE, IARG_END);
-	    }
-	    if (INS_IsMemoryRead(ins))
-	    {
-		INS_InsertCall(ins, IPOINT_BEFORE, (AFUNPTR)recordMemoryRead,
-			       IARG_MEMORYREAD_EA, 
-			       IARG_MEMORYREAD_SIZE, IARG_END);
-	    }
-
-	}
-
-	RTN_Close(rtn);
-	PIN_ReleaseLock(&lock);
-    }	    
+	    RTN rtn = RTN_FindByName(img, fname.c_str());
+	    
+	    if (!RTN_Valid(rtn))
+		continue;
+	    cout << "Procedure " << fname << " located." << endl;
+	    instrumentRoutine(rtn, 0);
+	}	    
+    }
 }
 
-
 /* ===================================================================== */
-/* Parse the list of functions we want to instrument                    */
+/* Parse the list of functions we want to instrument.                    */
+/* Return false if we can't open the file or it is empty.                */
+/* Return true otherwise.                                                */
 /* ===================================================================== */
 
-VOID parseFunctionList(const char *fname, vector<string> &list)
+bool parseFunctionList(const char *fname, vector<string> &list)
 {
-
+    bool selective = true;
     ifstream f;
     
     f.open(fname);
     
+    if(f.fail())
+    {
+	cerr << "Failed to open required file " << fname << endl;
+	exit(-1);
+    }
+
     cout << "Routines specified for instrumentation:" << endl;
     while(!f.eof())
     {
@@ -1164,10 +1225,50 @@ VOID parseFunctionList(const char *fname, vector<string> &list)
 	/* Lines beginning with a # are to be ignored */
 	if(name.find("#") == 0)
 	    continue;
+
+	/* Trim the string to get rid of empty ones */
+	trim(name);
+
+	if(name.length() == 0)
+	    continue;
+
+        /* See if we have a line with only * on it. 
+	 * If so, we are tracking all functions.
+	 */
+	if(name.compare("*") == 0)
+	{
+	    selective = false;
+	    continue;
+	}
+	
 	list.push_back(name);
     }
 
     f.close();
+    
+    if(list.size() == 0)
+    {
+	if(selective)
+	{
+	    cerr << "No function names in file " << fname << 
+		" and no line with '*'. " 
+		"Please specify what you want to track. " << endl;
+	    exit(-1);
+	}
+	return false;
+    }
+    else
+    {
+	if(!selective)
+	{
+	    cerr << "There appear to be names of function to track "
+		"in file " << fname << " as well as a line with '*'. "
+		"Don't understand if you want to track everything or just "
+		"selected functions. " << endl;
+	    exit(-1);
+	}
+	return true;
+    }
 }
 
 
@@ -1239,10 +1340,18 @@ int main(int argc, char *argv[])
         return Usage();
     }    
 
-
-    parseFunctionList(KnobTrackedFuncsFile.Value().c_str(), TrackedFuncsList);
+    selectiveInstrumentation = 
+	parseFunctionList(KnobTrackedFuncsFile.Value().c_str(), TrackedFuncsList);
     parseFunctionList(KnobAllocFuncsFile.Value().c_str(), AllocFuncsList);
     parseAllocFuncsProto(AllocFuncsList);
+
+    /* The selectiveInstrumentation flag tells us
+     * whether we want to instrument only selected
+     * functions for memory accesses. If it is false, 
+     * this means we want to instrument everything.
+     */
+    if(!selectiveInstrumentation)
+	RTN_AddInstrumentFunction(instrumentRoutine, 0);
 
     IMG_AddInstrumentFunction(Image, 0);
     PIN_AddThreadStartFunction(ThreadStart, 0);
