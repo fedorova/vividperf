@@ -385,22 +385,6 @@ const char * StripPath(const char * path)
 
 #define BILLION 1000000000
 
-char *allocFunctionName(RTN rtn)
-{
-    /* Allocate space to hold the name for this routine.
-     * We never free this space, because we need to keep
-     * it until the end of the program. So these strings
-     * will be freed when we exit the tool. 
-     */
-    char *rtnName = new char[RTN_Name(rtn).length()+1];
-    memset(rtnName, 0, RTN_Name(rtn).length()+1);
-    strncpy(rtnName, RTN_Name(rtn).c_str(), RTN_Name(rtn).length());
-
-    return rtnName;
-}
-
-
-
 bool fileError(ifstream &sourceFile, string file, int line)
 {
     if(!sourceFile)
@@ -774,21 +758,41 @@ done:
 /* Analysis routines                                                     */
 /* ===================================================================== */
 
-VOID callBeforeFunction(VOID *name)
+/* 
+ * Recording function-begin and function-end delimiters. 
+ * Every time the function is called, we ask Pin to 
+ * give us its name. I have tried obtaining the name
+ * at the time we insert the instrumentation and cache
+ * it, but this caused Pin to run out of memory when the
+ * tool was run on "real" applications. 
+ * So we dynamically obtain the name to avoid running
+ * the memory deficit.
+ */
+
+VOID callBeforeFunction(VOID *rtnAddr)
 {
     /* Don't track anything until we hit main() */
     if(!go)
 	return;
-    cout << "function-begin: " << PIN_ThreadId() << " " << (char*) name << endl;
 
+    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
+
+    PIN_GetLock(&lock, PIN_ThreadId() + 1);
+    cout << "function-begin: " << PIN_ThreadId() << " " << name << endl;
+    PIN_ReleaseLock(&lock);
 }
 
-VOID callAfterFunction(VOID *name)
+VOID callAfterFunction(VOID *rtnAddr)
 {
     /* Don't track anything until we hit main() */
     if(!go)
 	return;
-    cout << "function-end: " << PIN_ThreadId() << " " << (char*) name << endl;
+
+    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
+
+    PIN_GetLock(&lock, PIN_ThreadId() + 1);
+    cout << "function-end: " << PIN_ThreadId() << " " << name << endl;
+    PIN_ReleaseLock(&lock);
 
 }
 
@@ -956,12 +960,16 @@ VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
     if(LOUD)
 	cout << "<---- AFTER ALLOC " << endl;
 
-    /* Now, let's print the allocation record */
-    cout << "alloc: 0x" << hex << setfill('0') << setw(16) 
-	 << fr->thrAllocData[tid]->calledFromAddr
-	 << dec << " " << fr->name << " " << tid 
+    /* 
+     * Now, let's print the allocation record 
+     * Note, we could also print the calledFromAddr here, 
+     * but we are omitting it for the time being, assuming
+     * that we will have source lines for all interesting
+     * allocations.
+     */
+    cout << "alloc: " << tid 
 	 << " 0x" << hex << setfill('0') << setw(16) << fr->thrAllocData[tid]->addr 
-	 << dec 
+	 << dec << " " << fr->name  
 	 << " " << fr->thrAllocData[tid]->size << " " 
 	 << fr->thrAllocData[tid]->number 
 	 << " " << fr->thrAllocData[tid]->filename 
@@ -994,27 +1002,40 @@ VOID callBeforeMain()
  */
 
 // Print a memory write record
-VOID recordMemoryRead(ADDRINT addr, UINT32 size, VOID *rtnName)
+VOID recordMemoryRead(ADDRINT addr, UINT32 size, VOID *rtnAddr)
 {
+    /* Don't track until we hit main() */
+    if(!go)
+	return;
+
+    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
+
     THREADID threadid  = PIN_ThreadId();
     PIN_GetLock(&lock, threadid+1);
 
     cout << "read: " << threadid << " 0x" << hex << setw(16) 
 	 << setfill('0') << addr << dec << " " << size << " " 
-	 << (char*) rtnName << endl;
+	 << name << endl;
 
     PIN_ReleaseLock(&lock);
 }
 
 // Print a memory write record
-VOID recordMemoryWrite(ADDRINT addr, UINT32 size, VOID *rtnName)
+VOID recordMemoryWrite(ADDRINT addr, UINT32 size, VOID *rtnAddr)
 {
+
+    /* Don't track until we hit main() */
+    if(!go)
+	return;
+
+    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
+
     THREADID threadid  = PIN_ThreadId();
     PIN_GetLock(&lock, threadid+1);
 
     cout << "write: " << threadid << " 0x" << hex << setw(16) 
 	 << setfill('0') << addr << dec << " " << size << " " 
-	 << (char*) rtnName << endl;
+	 << name << endl;
 
     PIN_ReleaseLock(&lock);
 }
@@ -1027,15 +1048,14 @@ VOID instrumentRoutine(RTN rtn, VOID * unused)
 {
     RTN_Open(rtn);
 	    
-    char *rtnName = allocFunctionName(rtn);
 
     /* Instrument entry and exit to the routine to report
      * function-begin and function-end events.
      */
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBeforeFunction,
-		   IARG_PTR, rtnName, IARG_END);
+		   IARG_PTR, RTN_Address(rtn), IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)callAfterFunction,
-		   IARG_PTR, rtnName, IARG_END);
+		   IARG_PTR, RTN_Address(rtn), IARG_END);
 
 
     /* Insert instrumentation for each instruction in the routine */
@@ -1047,7 +1067,7 @@ VOID instrumentRoutine(RTN rtn, VOID * unused)
 				     (AFUNPTR)recordMemoryWrite,
 				     IARG_MEMORYWRITE_EA, 
 				     IARG_MEMORYWRITE_SIZE, 
-				     IARG_PTR, rtnName, IARG_END);
+				     IARG_PTR, RTN_Address(rtn), IARG_END);
 	}
 	if (INS_IsMemoryRead(ins))
 	{
@@ -1055,7 +1075,7 @@ VOID instrumentRoutine(RTN rtn, VOID * unused)
 				     (AFUNPTR)recordMemoryRead,
 				     IARG_MEMORYREAD_EA, 
 				     IARG_MEMORYREAD_SIZE, 
-				     IARG_PTR, rtnName, IARG_END);
+				     IARG_PTR, RTN_Address(rtn), IARG_END);
 	}
     }
 
