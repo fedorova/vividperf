@@ -166,6 +166,18 @@ string GDB_CMD_PFX = "gdb: ";
 /* ===================================================================== */
 /* Helper routines                                                       */
 /* ===================================================================== */
+VOID initThreadAllocData(ThreadAllocData *tr)
+{
+    tr->calledFromAddr = 0;
+    tr->line = 0;
+    tr->column = 0;
+    tr->size = 0;
+    tr->number = 0;
+    tr->addr = 0;
+    tr->retptr=0;
+}
+
+
 FuncRecord* findFuncRecord(vector<FuncRecord*> *frlist, string name)
 {
     assert(lock._owner != 0);
@@ -196,9 +208,7 @@ FuncRecord* allocateAndAdd(vector<FuncRecord*> *frlist,
     for(uint i = 0; i < largestUnusedThreadID; i++)
     {
 	ThreadAllocData *tr = new ThreadAllocData();
-
-	/* Zero out all the POD, but don't touch the C++ string */
-	memset(tr, 0, offsetof(ThreadAllocData, filename));
+	initThreadAllocData(tr);
 	fr->thrAllocData.push_back(tr);
     }
 
@@ -746,8 +756,6 @@ string findAllocVarName(string file, int line, string func, int arg,
 	trimVarName(var);
     }
 
-    if(LOUD)
-	cout << "Var name is: " << var << endl;
 done:
     sourceFile.close();
     return var;
@@ -813,15 +821,21 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
 
     if(LOUD)
     {
+	PIN_GetLock(&lock, PIN_ThreadId() + 1);
 	cout << "----> BEFORE ALLOC(" << tid << ")" << fr->name 
 	     << ". Return address is: " << hex << addr << dec << endl;
+	PIN_ReleaseLock(&lock);
     }
 
     assert(fr->thrAllocData.size() > tid);
 
     if(fr->thrAllocData[tid]->calledFromAddr != 0)
+    {
+	PIN_GetLock(&lock, PIN_ThreadId() + 1);
 	cout << "Warning: recursive allocation: " << fr->name <<
 	    ", retaddr: " << hex << addr << dec << ", size: " << size << endl;
+	PIN_ReleaseLock(&lock);
+    }
 
     /* This check for noSourceInfo can race, but in the worst case, 
      * we'll just do a little bit extra work. 
@@ -835,9 +849,6 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
 
 	if(it == fr->locationCache.end())
 	{
-	    if(LOUD)
-		cout << "Location " << hex << addr << dec << 
-		    " not cached" << endl;
 
 	    PIN_LockClient();
 	    PIN_GetSourceLocation(addr, &column, &line, &filename);
@@ -860,14 +871,8 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
 		sloc->varname = "unknown";
 
 		if(KnobWithGDB)
-		{
-		    if(LOUD)
-			cout << "Disabling breakpoint " << fr->breakID 
-			     << " in " << fr->name << endl << 
-			    "No debug information is present " << endl;
-
 		    cout << GDB_CMD_PFX << "disable " << fr->breakID << endl;
-		}
+
 	    }
 	    else if(filename.length() > 0 && line > 0)
 	    {
@@ -879,7 +884,7 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
 		{
 		    /* Ask about the varType from GDB */
 		    cout << GDB_CMD_PFX << "finish " << endl;
-		    cout << GDB_CMD_PFX << "whatis " << varname << endl;    
+		    cout << GDB_CMD_PFX << "whatis " << varname << endl;  
 		}
 
 		sloc->varname = varname;
@@ -922,7 +927,11 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
     fr->thrAllocData[tid]->varName = varname;
 
     if(LOUD)
+    {
+	PIN_GetLock(&lock, PIN_ThreadId() + 1);
 	cout << "<---- BEFORE ALLOC" << endl;
+	PIN_ReleaseLock(&lock);
+    }
 
 }
 
@@ -933,10 +942,13 @@ VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
 	return;
 
     if(LOUD)
+    {
+	PIN_GetLock(&lock, PIN_ThreadId() + 1);
 	cout << "----> AFTER ALLOC " << fr->name << " (" << tid << ")" << endl; 
+	PIN_ReleaseLock(&lock);
+    }
 
-    cout.flush();
-
+    
     assert(fr->thrAllocData.size() > tid);
     assert(fr->thrAllocData[tid]->calledFromAddr != 0);
     
@@ -958,8 +970,11 @@ VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
     }
 
     if(LOUD)
+    {
+	PIN_GetLock(&lock, PIN_ThreadId() + 1);
 	cout << "<---- AFTER ALLOC " << endl;
-
+	PIN_ReleaseLock(&lock);
+    }
     /* 
      * Now, let's print the allocation record 
      * Note, we could also print the calledFromAddr here, 
@@ -967,6 +982,7 @@ VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
      * that we will have source lines for all interesting
      * allocations.
      */
+    PIN_GetLock(&lock, PIN_ThreadId() + 1);
     cout << "alloc: " << tid 
 	 << " 0x" << hex << setfill('0') << setw(16) << fr->thrAllocData[tid]->addr 
 	 << dec << " " << fr->name  
@@ -976,6 +992,7 @@ VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
 	 << ":" << fr->thrAllocData[tid]->line
 	 << " " << fr->thrAllocData[tid]->varName
 	 << endl << endl; 
+    PIN_ReleaseLock(&lock);
 
     /* Since we are exiting the function, let's reset the
      * "called from" address, to indicate that we are no longer
@@ -1002,27 +1019,42 @@ VOID callBeforeMain()
  */
 
 // Print a memory write record
-VOID recordMemoryRead(ADDRINT addr, UINT32 size, VOID *rtnAddr)
+VOID recordMemoryRead(ADDRINT addr, UINT32 size, ADDRINT codeAddr, VOID *rtnAddr)
 {
+    string filename;
+    INT32 column = 0, line = 0;
+    string source = "<unknown>";
+
     /* Don't track until we hit main() */
     if(!go)
 	return;
 
     string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
 
-    THREADID threadid  = PIN_ThreadId();
-    PIN_GetLock(&lock, threadid+1);
+    PIN_LockClient();
+    PIN_GetSourceLocation(codeAddr, &column, &line, &filename);
+    PIN_UnlockClient();
+    
+    if(filename.length() > 0)
+    {
+        source = filename + ":" + to_string(line);
+    }
 
-    cout << "read: " << threadid << " 0x" << hex << setw(16) 
+    PIN_GetLock(&lock, PIN_ThreadId()+1);
+
+    cout << "read: " << PIN_ThreadId() << " 0x" << hex << setw(16) 
 	 << setfill('0') << addr << dec << " " << size << " " 
-	 << name << endl;
-
+	 << name << " " << source << endl;
+    cout.flush();
     PIN_ReleaseLock(&lock);
 }
 
 // Print a memory write record
-VOID recordMemoryWrite(ADDRINT addr, UINT32 size, VOID *rtnAddr)
+VOID recordMemoryWrite(ADDRINT addr, UINT32 size, ADDRINT codeAddr, VOID *rtnAddr)
 {
+    string filename;
+    INT32 column = 0, line = 0;
+    string source = "<unknown>";
 
     /* Don't track until we hit main() */
     if(!go)
@@ -1030,13 +1062,21 @@ VOID recordMemoryWrite(ADDRINT addr, UINT32 size, VOID *rtnAddr)
 
     string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
 
-    THREADID threadid  = PIN_ThreadId();
-    PIN_GetLock(&lock, threadid+1);
+    PIN_LockClient();
+    PIN_GetSourceLocation(codeAddr, &column, &line, &filename);
+    PIN_UnlockClient();
+    
+    if(filename.length() > 0)
+    {
+        source = filename + ":" + to_string(line);
+    }
 
-    cout << "write: " << threadid << " 0x" << hex << setw(16) 
+    PIN_GetLock(&lock, PIN_ThreadId()+1);
+
+    cout << "write: " << PIN_ThreadId() << " 0x" << hex << setw(16) 
 	 << setfill('0') << addr << dec << " " << size << " " 
-	 << name << endl;
-
+	 << name << " " << source << endl;
+    cout.flush();
     PIN_ReleaseLock(&lock);
 }
 
@@ -1067,6 +1107,7 @@ VOID instrumentRoutine(RTN rtn, VOID * unused)
 				     (AFUNPTR)recordMemoryWrite,
 				     IARG_MEMORYWRITE_EA, 
 				     IARG_MEMORYWRITE_SIZE, 
+				     IARG_PTR, INS_Address(ins), 
 				     IARG_PTR, RTN_Address(rtn), IARG_END);
 	}
 	if (INS_IsMemoryRead(ins))
@@ -1075,6 +1116,7 @@ VOID instrumentRoutine(RTN rtn, VOID * unused)
 				     (AFUNPTR)recordMemoryRead,
 				     IARG_MEMORYREAD_EA, 
 				     IARG_MEMORYREAD_SIZE, 
+				     IARG_PTR, INS_Address(ins), 
 				     IARG_PTR, RTN_Address(rtn), IARG_END);
 	}
     }
@@ -1330,9 +1372,7 @@ VOID ThreadStart(THREADID threadid, CONTEXT *ctxt, INT32 flags, VOID *v)
 	{
 
 	    ThreadAllocData *tr = new ThreadAllocData();
-
-	    /* Zero out all the pods, but don't touch the C++ string */
-	    memset(tr, 0, offsetof(ThreadAllocData, filename));
+	    initThreadAllocData(tr);
 	    fr->thrAllocData.push_back(tr);
 	}
     }
