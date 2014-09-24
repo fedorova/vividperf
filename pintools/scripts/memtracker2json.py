@@ -104,9 +104,9 @@ def parseMemoryAccess(line):
     addr = "<unknown>";
     size = "<unknown>";
     funcName = "<unknown>";
-    sourceLoc = "<unknown>";
     varName = "<unknown>";
     varType = "<unknown>";
+    allocLoc = "<unknown>";
 
     words = line.split(" ");
             
@@ -122,11 +122,12 @@ def parseMemoryAccess(line):
         if(i == 4):
             funcName = words[i];
         if(i == 5):
-            sourceLoc = words[i];
-        if(i == 6):
             varName = words[i];
-        if(i == 7):
+        if(i == 6):
             varType = words[i];    
+        if(i == 7):
+            allocLoc = words[i];
+
 
     # Now print the JSON record
     print("{\"event\": \"memory-access\", " 
@@ -135,7 +136,7 @@ def parseMemoryAccess(line):
           "\"address\": \"" + addr + "\", "
           "\"size\": \"" + size + "\", "
           "\"function\": \"" + funcName + "\", "
-          "\"source-location\": \"" + sourceLoc + "\", "
+          "\"alloc-location\": \"" + allocLoc + "\", "
           "\"var-name\": \"" + varName + "\", "
           "\"var-type\": \"" + varType + "\"}");
 
