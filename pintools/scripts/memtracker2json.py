@@ -444,7 +444,7 @@ def main():
             parseWithProcesses(args.infile, args.keepdots);
         else:
             fdTrace = open(args.infile, "r");
-            parse(fdTrace, args.keepdots, linenum, sys.stdout);
+            parse(fdTrace, args.keepdots, sys.stdout);
 
 if __name__ == '__main__':
     main()
