@@ -212,7 +212,8 @@ def parseAlloc(line, out):
     existingAlloc = findOverlappingAlloc(memAllocations, alloc);
 
     if(existingAlloc is not None):
-        print "Allocation " + str(alloc) + " overlaps with " + str(existingAlloc);
+        sys.stderr.write("Allocation " + str(alloc) + 
+                         " overlaps with " + str(existingAlloc) + "\n");
         del memAllocations[existingAlloc];
         
     memAllocations[alloc] = r;
