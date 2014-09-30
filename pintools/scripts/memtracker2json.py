@@ -203,11 +203,11 @@ def parseAlloc(line, out):
 
     out.write(str(r) + "\n");
 
+
     # Add this memory allocation to the dictionary
     # First check if one with an overlapping range already exists. 
     # If so, we assume it was freed (we don't track frees yet)
-    # and delete it. 
-    #
+    # and delete it.
     alloc = MemoryRange(addr, str(int(size) * int(numItems)));
     existingAlloc = findOverlappingAlloc(memAllocations, alloc);
 
@@ -258,9 +258,13 @@ def parseMemoryAccess(line, out):
                      varName, varType, allocLoc);
     
     if(notValidHex(addr)):
-        print "Corrupted record: "
-        print line
+        sys.stderr.write("Corrupted record: \n")
+        sys.stderr.write(line)
         return;
+
+    # XXXXX
+    #out.write(str(r) + "\n");
+    #return;
 
     # Let's create a MemoryRange object to see if
     # there is a memory allocation corresponding to
@@ -268,6 +272,12 @@ def parseMemoryAccess(line, out):
     # source location and variable information and 
     # add it to the record
     #
+    # We only track non-stack addresses
+    #
+    if(int(addr, 16) > 0x00007f0000000000):
+        out.write(str(r) + "\n");
+        return;
+
     m = MemoryRange(addr, size);
     allocRecord = findMatchingAllocation(memAllocations, m);
 

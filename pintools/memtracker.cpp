@@ -87,6 +87,43 @@ INT32 Usage()
     return -1;
 }
 
+/* ==================================================================== 
+ * A few helper classes to keep a record of memory allocations
+ */
+
+class MemoryRange
+{
+public:
+    ADDRINT base;
+    ADDRINT size;
+						
+    MemoryRange(ADDRINT _base, ADDRINT _size):
+	base(_base), size(_size) {};
+
+    bool operator<( const MemoryRange& other) const
+	{
+	    if( base+size < other.base )
+	    {
+		return true;
+	    }
+	    else
+		return false;
+	};
+
+};
+
+class AllocRecord
+{
+public:
+    string  sourceFile;
+    int sourceLine;
+    string  varName;
+
+    AllocRecord(string file, int line, string varname):
+	sourceFile(file), sourceLine(line), varName(varname) {};
+};
+
+map<MemoryRange, AllocRecord> allocmap;
 
 /* ===================================================================== */
 
@@ -787,6 +824,7 @@ VOID callBeforeFunction(VOID *rtnAddr)
 
     PIN_GetLock(&lock, PIN_ThreadId() + 1);
     cout << "function-begin: " << PIN_ThreadId() << " " << name << endl;
+    cout.flush();
     PIN_ReleaseLock(&lock);
 }
 
@@ -800,6 +838,7 @@ VOID callAfterFunction(VOID *rtnAddr)
 
     PIN_GetLock(&lock, PIN_ThreadId() + 1);
     cout << "function-end: " << PIN_ThreadId() << " " << name << endl;
+    cout.flush();
     PIN_ReleaseLock(&lock);
 
 }
@@ -844,6 +883,10 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
     {
 	PIN_GetLock(&lock, PIN_ThreadId() + 1);
 
+	PIN_LockClient();
+	PIN_GetSourceLocation(addr, &column, &line, &filename);
+	PIN_UnlockClient();
+/*
 	map<ADDRINT, SourceLocation*>::iterator it = 
 	    fr->locationCache.find(addr);
 
@@ -859,12 +902,12 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
 	    sloc->line = line;
 
 
-	    /* If we are getting an empty string, then this means
+	    * If we are getting an empty string, then this means
 	     * that this alloc function has no debug information
 	     * associated with it, so there is nothing we can do
 	     * to figure out the type of the allocated object. 
 	     * Disable the breakpoint, so it doesn't slow us down.
-	     */
+	     *
 	    if(filename.length() == 0)
 	    {
 		fr->noSourceInfo = true;
@@ -882,7 +925,7 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
 
 		if(KnobWithGDB)
 		{
-		    /* Ask about the varType from GDB */
+		    * Ask about the varType from GDB *
 		    cout << GDB_CMD_PFX << "finish " << endl;
 		    cout << GDB_CMD_PFX << "whatis " << varname << endl;  
 		}
@@ -890,7 +933,7 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
 		sloc->varname = varname;
 	    }
 
-	    /* Insert this record into the cache */
+	    * Insert this record into the cache *
 	    fr->locationCache.insert(make_pair(addr, sloc));
 		    
 	}
@@ -906,8 +949,8 @@ VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number,
 		cout << "Source location: " << filename << ":" << line << endl;
 		cout << "Varname: " << varname << endl;
 	    }
-
-	}
+*/
+    
 	if(KnobWithGDB)
 	    cout << GDB_CMD_PFX << "cont " << endl;    
 
@@ -992,6 +1035,29 @@ VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
 	 << ":" << fr->thrAllocData[tid]->line
 	 << " " << fr->thrAllocData[tid]->varName
 	 << endl << endl; 
+    cout.flush();
+
+    /* Let's remember that allocation record */
+    {
+	ADDRINT base = fr->thrAllocData[tid]->addr;
+	size_t size = fr->thrAllocData[tid]->size * 
+	    fr->thrAllocData[tid]->number;
+	MemoryRange *mr = new MemoryRange(base, size);
+
+	string filename = fr->thrAllocData[tid]->filename;
+	int line = fr->thrAllocData[tid]->line;
+	string varName = fr->thrAllocData[tid]->varName;
+	AllocRecord *ar = new AllocRecord(filename, line, varName);
+
+	map<MemoryRange, AllocRecord>::iterator it =
+	    allocmap.find(*mr);
+
+	if(it != allocmap.end())
+	    allocmap.erase(it);
+	
+	allocmap.insert(make_pair(*mr, *ar));
+	
+    }
     PIN_ReleaseLock(&lock);
 
     /* Since we are exiting the function, let's reset the
@@ -1017,7 +1083,6 @@ VOID callBeforeMain()
  * Callback functions to trace memory accesses.
  *
  */
-
 // Print a memory write record
 VOID recordMemoryRead(ADDRINT addr, UINT32 size, ADDRINT codeAddr, VOID *rtnAddr)
 {
@@ -1042,10 +1107,34 @@ VOID recordMemoryRead(ADDRINT addr, UINT32 size, ADDRINT codeAddr, VOID *rtnAddr
 
     PIN_GetLock(&lock, PIN_ThreadId()+1);
 
-    cout << "read: " << PIN_ThreadId() << " 0x" << hex << setw(16) 
-	 << setfill('0') << addr << dec << " " << size << " " 
-	 << name << " " << source << endl;
+    /* Let's retrieve the allocation information for this access */
+    if(addr > 0x0000700000000000)
+    {
+	MemoryRange mr(addr, size);
+	map<MemoryRange, AllocRecord>::iterator it =
+	    allocmap.find(mr);
+	if(it != allocmap.end())
+	{
+	    cout << "read: " << PIN_ThreadId() << " 0x" << hex << setw(16) 
+		 << setfill('0') << addr << dec << " " << size << " " 
+		 << name << " " << source << " " << it->second.sourceFile
+		 << ":" << it->second.sourceLine << " " << it->second.varName << endl;
+	}
+    }
+    else
+    {
+	cout << "read: " << PIN_ThreadId() << " 0x" << hex << setw(16) 
+	     << setfill('0') << addr << dec << " " << size << " " 
+	     << name << " " << source << endl;
+    }
+
+    /* Flush so we don't run out of memory. 
+     * Flushing less frequently doesn't help performance much.
+     * Flushing even less frequently makes us run out of memory.
+     * So flush every time. 
+     */
     cout.flush();
+
     PIN_ReleaseLock(&lock);
 }
 
@@ -1076,7 +1165,14 @@ VOID recordMemoryWrite(ADDRINT addr, UINT32 size, ADDRINT codeAddr, VOID *rtnAdd
     cout << "write: " << PIN_ThreadId() << " 0x" << hex << setw(16) 
 	 << setfill('0') << addr << dec << " " << size << " " 
 	 << name << " " << source << endl;
+
+    /* Flush so we don't run out of memory. 
+     * Flushing less frequently doesn't help performance much.
+     * Flushing even less frequently makes us run out of memory.
+     * So flush every time. 
+     */
     cout.flush();
+
     PIN_ReleaseLock(&lock);
 }
 

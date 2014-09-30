@@ -125,25 +125,23 @@ def parseLog(fdLog):
         if line.startswith("alloc:"):
 
             words = line.split(" ");
-            if(len(words) != 9):
+            if(len(words) != 8):
                 print("Unexpected format of the allocation record on line "
                       + str(lineNum)); 
                 print(line);
                 print("Expected format:")
-                print("alloc: <code addr> <func_name> <thread_id> <alloc addr> " +
+                print("alloc: <thread id> <alloc addr> <func_name> " +
                       "<alloc size> <num items> <source file:line> <varname>");
                 continue;
 
             allocRecord = AllocationRecord();
-
-            allocRecord.codeAddr = words[1];
-            allocRecord.funcName = words[2];
-            allocRecord.threadID = int(words[3]);
-            allocRecord.addr = words[4];
-            allocRecord.size = int(words[5]);
-            allocRecord.numItems = int(words[6]);
-            allocRecord.sourceLoc = words[7];
-            allocRecord.varName = words[8];
+            allocRecord.threadID = int(words[1]);
+            allocRecord.addr = words[2];
+            allocRecord.funcName = words[3];
+            allocRecord.size = int(words[4]);
+            allocRecord.numItems = int(words[5]);
+            allocRecord.sourceLoc = words[6];
+            allocRecord.varName = words[7];
             allocRecord.varType = "<unknown>"
 
            # allocRecord.printRecord();

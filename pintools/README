@@ -58,6 +58,10 @@ alloc.in provides a list of alloc functions that you want to track. See a sample
 
 The other file, memtracker.in, tells the tool the names of the functions in which you want to track the memory accesses. If you want to track everything, this file needs to contain a line with a '*' on it and nothing else. If you do not want to trace the entire program, but isolate your analysis to a problematic function (or functions), specify the function names you want to track, one per line. Lines starting with a '#' are ignored, so you can add comments on lines prefixed with a '#'.  See a sample memtracker.in in this repository (scripts directory) for the explanation of the expected format. 
 
+PERFORMANCE CONSIDERATIONS:
+
+The key concern with this tool is that Pin may run out of memory while executing it. To reduce the changes of this happening, do not redirect the output to RAMFS, because based on my experience, this makes Pin more likely to run out of memory. 
+
 HOW THE TOOL OBTAINS VARIABLE NAMES AND TYPES:
 
 We get the name of the allocated variable by parsing the source file. The source location of the call to the alloc function can be obtained from within a Pintool. In most cases, the name of the variable is sufficient to identify the allocated object, because most programmers give their variables intuitive names. For instance, if you called a variable "node", you can guess that it is of type "BT_NODE", if this type is defined in your program. However, if desired, we can also obtain variable types. 
