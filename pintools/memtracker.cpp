@@ -43,14 +43,19 @@ END_LEGAL */
 
 /* ===================================================================== */
 /* Global Variables */
-/* ===================================================================== */
+ /* ===================================================================== */
 using namespace std;
-
 
 PIN_LOCK lock;
 bool LOUD = false;
 bool go = false;
 bool selectiveInstrumentation = false;
+
+char fBeginStr[] = "function-begin:";
+char fEndStr[] = "function-end:";
+
+char readStr[] = "read:";
+char writeStr[] = "write:";
 
 #define BITS_PER_BYTE 8
 
@@ -72,9 +77,6 @@ KNOB<string> KnobAllocFuncsFile(KNOB_MODE_WRITEONCE, "pintool",
 KNOB<int> KnobAppPtrSize(KNOB_MODE_WRITEONCE, "pintool",
 				"p", "64", "application pointer size in bits (default is 64)");
 
-KNOB<bool> KnobWithGDB(KNOB_MODE_WRITEONCE, "pintool", "g", "false", 
-		       "Are we running with the concurrent GDB session to find allocated types or not?");
-
 
 /* ===================================================================== */
 /* Print Help Message                                                    */
@@ -87,22 +89,49 @@ INT32 Usage()
     return -1;
 }
 
-
-/* ===================================================================== */
-
-/* We keep track of two types of functions: 
- *   - Optionally, the functions the user wants us to track for memory accesses.
- *     By default we keep track of accesses in the entire program. 
- *   - *alloc functions that perform memory allocations. We need those so we
- *     can record the addresses allocated on the heap and call sites of those
- *     allocations, so we can later resolve the type and contents of the
- *     memory location. 
+/* ==================================================================== 
+ * A few helper classes to keep a record of memory allocations
  */
+
+class MemoryRange
+{
+public:
+    ADDRINT base;
+    ADDRINT size;
+						
+    MemoryRange(ADDRINT _base, ADDRINT _size):
+	base(_base), size(_size) {};
+
+    bool operator<( const MemoryRange& other) const
+	{
+	    if( base+size < other.base )
+	    {
+		return true;
+	    }
+	    else
+		return false;
+	};
+
+};
+
+class AllocRecord
+{
+public:
+    string  sourceFile;
+    int sourceLine;
+    string  varName;
+
+    AllocRecord(string file, int line, string varname):
+	sourceFile(file), sourceLine(line), varName(varname) {};
+};
+
+map<MemoryRange, AllocRecord> allocmap;
+
 vector<string> TrackedFuncsList;
 vector<string> AllocFuncsList;
 
 /* This struct describes the prototype of an alloc function 
- * Fiolds "number", "size" and "retaddr" tell us which argument (first argument is indexed '0')
+ * Fields "number", "size" and "retaddr" tell us which argument (first argument is indexed '0')
  * gives us the number of elements to allocate, the allocation size and the
  * return address pointer. If we always allocate one item of the given size
  * (as in malloc), the field "number" should be "-1". If the function returns the address
@@ -115,7 +144,7 @@ typedef struct func_proto
     int number;
     int size;
     int retaddr;
-    vector<struct func_proto*> otherFuncProto;
+    vector<struct func_proto*> *otherFuncProto;
 } FuncProto;
 
 vector<FuncProto *> funcProto;
@@ -130,22 +159,12 @@ vector<FuncProto *> funcProto;
 typedef struct thread_alloc_data
 {
     ADDRINT calledFromAddr;
-    int line;
-    int column;
     ADDRINT size;
     int number;
     ADDRINT addr;
     ADDRINT retptr;
-    string filename;
-    string varName;
 } ThreadAllocData;
 
-typedef struct source_location
-{
-    string filename;
-    int line;
-    string varname;
-} SourceLocation;
 
 typedef struct func_record
 {
@@ -153,30 +172,17 @@ typedef struct func_record
     int breakID;
     int retaddr;
     bool noSourceInfo;
-    vector<FuncProto *> otherFuncProto;
-    map<ADDRINT, SourceLocation*> locationCache;
-    vector<ThreadAllocData*> thrAllocData; 
+    vector<FuncProto*> *otherFuncProto;
+    vector<ThreadAllocData*> *thrAllocData; 
 } FuncRecord;
 
 vector<FuncRecord*> funcRecords;
 unsigned int largestUnusedThreadID = 0;
 
-string GDB_CMD_PFX = "gdb: ";
 
 /* ===================================================================== */
 /* Helper routines                                                       */
 /* ===================================================================== */
-VOID initThreadAllocData(ThreadAllocData *tr)
-{
-    tr->calledFromAddr = 0;
-    tr->line = 0;
-    tr->column = 0;
-    tr->size = 0;
-    tr->number = 0;
-    tr->addr = 0;
-    tr->retptr=0;
-}
-
 
 FuncRecord* findFuncRecord(vector<FuncRecord*> *frlist, string name)
 {
@@ -204,12 +210,13 @@ FuncRecord* allocateAndAdd(vector<FuncRecord*> *frlist,
     fr->name = fp->name; 
     fr->retaddr = fp->retaddr;
     fr->otherFuncProto = fp->otherFuncProto;
+    fr->thrAllocData = new vector<ThreadAllocData*>();
 
     for(uint i = 0; i < largestUnusedThreadID; i++)
     {
 	ThreadAllocData *tr = new ThreadAllocData();
-	initThreadAllocData(tr);
-	fr->thrAllocData.push_back(tr);
+	memset(tr, 0, sizeof(ThreadAllocData));
+	fr->thrAllocData->push_back(tr);
     }
 
     return fr;
@@ -324,6 +331,7 @@ VOID parseAllocFuncsProto(vector<string> funcs)
 	int iter = 0;
 	
 	FuncProto *fp = new FuncProto();
+	fp->otherFuncProto = new vector<FuncProto*>();
 
 	while(!str.eof())
 	{
@@ -376,7 +384,7 @@ VOID parseAllocFuncsProto(vector<string> funcs)
 			"line (no \"!\" in the beginning)." << endl;
 		    exit(-1);
 		}
-		last->otherFuncProto.push_back(fp);
+		last->otherFuncProto->push_back(fp);
 		cout << last->name << " has alternative function "
 		    "prototype under name " << fp->name << endl;
 	    }
@@ -762,244 +770,10 @@ done:
 }
 
 
+
 /* ===================================================================== */
 /* Analysis routines                                                     */
 /* ===================================================================== */
-
-/* 
- * Recording function-begin and function-end delimiters. 
- * Every time the function is called, we ask Pin to 
- * give us its name. I have tried obtaining the name
- * at the time we insert the instrumentation and cache
- * it, but this caused Pin to run out of memory when the
- * tool was run on "real" applications. 
- * So we dynamically obtain the name to avoid running
- * the memory deficit.
- */
-
-VOID callBeforeFunction(VOID *rtnAddr)
-{
-    /* Don't track anything until we hit main() */
-    if(!go)
-	return;
-
-    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
-
-    PIN_GetLock(&lock, PIN_ThreadId() + 1);
-    cout << "function-begin: " << PIN_ThreadId() << " " << name << endl;
-    PIN_ReleaseLock(&lock);
-}
-
-VOID callAfterFunction(VOID *rtnAddr)
-{
-    /* Don't track anything until we hit main() */
-    if(!go)
-	return;
-
-    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
-
-    PIN_GetLock(&lock, PIN_ThreadId() + 1);
-    cout << "function-end: " << PIN_ThreadId() << " " << name << endl;
-    PIN_ReleaseLock(&lock);
-
-}
-
-VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number, 
-		     ADDRINT size, ADDRINT retptr)
-{
-    INT32 column = 0, line = 0;
-    string filename = ""; 
-    string varname;
-
-    /* We were called before the application has begun running main.
-     * This can happen for malloc calls. Don't do anything. But tell the
-     * python GDB driver to let us continue. 
-     */
-    if(!go)
-	return;
-
-
-    if(LOUD)
-    {
-	PIN_GetLock(&lock, PIN_ThreadId() + 1);
-	cout << "----> BEFORE ALLOC(" << tid << ")" << fr->name 
-	     << ". Return address is: " << hex << addr << dec << endl;
-	PIN_ReleaseLock(&lock);
-    }
-
-    assert(fr->thrAllocData.size() > tid);
-
-    if(fr->thrAllocData[tid]->calledFromAddr != 0)
-    {
-	PIN_GetLock(&lock, PIN_ThreadId() + 1);
-	cout << "Warning: recursive allocation: " << fr->name <<
-	    ", retaddr: " << hex << addr << dec << ", size: " << size << endl;
-	PIN_ReleaseLock(&lock);
-    }
-
-    /* This check for noSourceInfo can race, but in the worst case, 
-     * we'll just do a little bit extra work. 
-     */
-    if(!fr->noSourceInfo)
-    {
-	PIN_GetLock(&lock, PIN_ThreadId() + 1);
-
-	map<ADDRINT, SourceLocation*>::iterator it = 
-	    fr->locationCache.find(addr);
-
-	if(it == fr->locationCache.end())
-	{
-
-	    PIN_LockClient();
-	    PIN_GetSourceLocation(addr, &column, &line, &filename);
-	    PIN_UnlockClient();
-	    
-	    SourceLocation *sloc = new SourceLocation();
-	    sloc->filename = filename;
-	    sloc->line = line;
-
-
-	    /* If we are getting an empty string, then this means
-	     * that this alloc function has no debug information
-	     * associated with it, so there is nothing we can do
-	     * to figure out the type of the allocated object. 
-	     * Disable the breakpoint, so it doesn't slow us down.
-	     */
-	    if(filename.length() == 0)
-	    {
-		fr->noSourceInfo = true;
-		sloc->varname = "unknown";
-
-		if(KnobWithGDB)
-		    cout << GDB_CMD_PFX << "disable " << fr->breakID << endl;
-
-	    }
-	    else if(filename.length() > 0 && line > 0)
-	    {
-		varname = 
-		    findAllocVarName(filename, line, fr->name, fr->retaddr,
-				     fr->otherFuncProto);
-
-		if(KnobWithGDB)
-		{
-		    /* Ask about the varType from GDB */
-		    cout << GDB_CMD_PFX << "finish " << endl;
-		    cout << GDB_CMD_PFX << "whatis " << varname << endl;  
-		}
-
-		sloc->varname = varname;
-	    }
-
-	    /* Insert this record into the cache */
-	    fr->locationCache.insert(make_pair(addr, sloc));
-		    
-	}
-	else {
-
-	    filename = it->second->filename;
-	    line = it->second->line;
-	    varname = it->second->varname;
-
-	    if(LOUD)
-	    {
-		cout << "Found " << hex << addr << dec << " in cache" << endl;
-		cout << "Source location: " << filename << ":" << line << endl;
-		cout << "Varname: " << varname << endl;
-	    }
-
-	}
-	if(KnobWithGDB)
-	    cout << GDB_CMD_PFX << "cont " << endl;    
-
-	PIN_ReleaseLock(&lock);
-    }
-
-
-    fr->thrAllocData[tid]->calledFromAddr = addr;
-    fr->thrAllocData[tid]->filename = filename;
-    fr->thrAllocData[tid]->line = line;
-    fr->thrAllocData[tid]->column = column;
-
-    fr->thrAllocData[tid]->size = size;
-    fr->thrAllocData[tid]->number = number;
-    fr->thrAllocData[tid]->retptr = retptr;
-
-    fr->thrAllocData[tid]->varName = varname;
-
-    if(LOUD)
-    {
-	PIN_GetLock(&lock, PIN_ThreadId() + 1);
-	cout << "<---- BEFORE ALLOC" << endl;
-	PIN_ReleaseLock(&lock);
-    }
-
-}
-
-VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
-{
-
-    if(!go)
-	return;
-
-    if(LOUD)
-    {
-	PIN_GetLock(&lock, PIN_ThreadId() + 1);
-	cout << "----> AFTER ALLOC " << fr->name << " (" << tid << ")" << endl; 
-	PIN_ReleaseLock(&lock);
-    }
-
-    
-    assert(fr->thrAllocData.size() > tid);
-    assert(fr->thrAllocData[tid]->calledFromAddr != 0);
-    
-
-    if(fr->thrAllocData[tid]->retptr == 0)
-    {
-	/* The address of the allocated chunk is the 
-	   return value of the function */
-	fr->thrAllocData[tid]->addr = addr;
-    }
-    else
-    {
-	/* The address of the allocated chunk is in the location pointed to 
-	 * by the retptr argument we received as the argument to the function
-	 */
-	PIN_SafeCopy( &(fr->thrAllocData[tid]->addr), 
-		      (const void*)fr->thrAllocData[tid]->retptr, 
-		      KnobAppPtrSize/BITS_PER_BYTE);
-    }
-
-    if(LOUD)
-    {
-	PIN_GetLock(&lock, PIN_ThreadId() + 1);
-	cout << "<---- AFTER ALLOC " << endl;
-	PIN_ReleaseLock(&lock);
-    }
-    /* 
-     * Now, let's print the allocation record 
-     * Note, we could also print the calledFromAddr here, 
-     * but we are omitting it for the time being, assuming
-     * that we will have source lines for all interesting
-     * allocations.
-     */
-    PIN_GetLock(&lock, PIN_ThreadId() + 1);
-    cout << "alloc: " << tid 
-	 << " 0x" << hex << setfill('0') << setw(16) << fr->thrAllocData[tid]->addr 
-	 << dec << " " << fr->name  
-	 << " " << fr->thrAllocData[tid]->size << " " 
-	 << fr->thrAllocData[tid]->number 
-	 << " " << fr->thrAllocData[tid]->filename 
-	 << ":" << fr->thrAllocData[tid]->line
-	 << " " << fr->thrAllocData[tid]->varName
-	 << endl << endl; 
-    PIN_ReleaseLock(&lock);
-
-    /* Since we are exiting the function, let's reset the
-     * "called from" address, to indicate that we are no longer
-     * in the middle of the function call. 
-     */
-    fr->thrAllocData[tid]->calledFromAddr = 0;
-}
 
 /* 
  * Callbacks on alloc functions are not working properly before main() is called.
@@ -1013,72 +787,180 @@ VOID callBeforeMain()
     go = true;
 }
 
-/*
- * Callback functions to trace memory accesses.
- *
- */
-
-// Print a memory write record
-VOID recordMemoryRead(ADDRINT addr, UINT32 size, ADDRINT codeAddr, VOID *rtnAddr)
+VOID callBeforeAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr, ADDRINT number, 
+		     ADDRINT size, ADDRINT retptr)
 {
-    string filename;
-    INT32 column = 0, line = 0;
-    string source = "<unknown>";
-
-    /* Don't track until we hit main() */
+    /* We were called before the application has begun running main.
+     * This can happen for malloc calls. Don't do anything. But tell the
+     * python GDB driver to let us continue. 
+     */
     if(!go)
 	return;
 
-    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
+    assert(fr->thrAllocData->size() > tid);
 
-    PIN_LockClient();
-    PIN_GetSourceLocation(codeAddr, &column, &line, &filename);
-    PIN_UnlockClient();
-    
-    if(filename.length() > 0)
+    if((*fr->thrAllocData)[tid]->calledFromAddr != 0)
     {
-        source = filename + ":" + to_string(line);
+	PIN_GetLock(&lock, PIN_ThreadId() + 1);
+	cout << "Warning: recursive allocation: " << fr->name <<
+	    ", retaddr: " << hex << addr << dec << ", size: " << size << endl;
+	PIN_ReleaseLock(&lock);
     }
 
-    PIN_GetLock(&lock, PIN_ThreadId()+1);
+    (*fr->thrAllocData)[tid]->calledFromAddr = addr;
+    (*fr->thrAllocData)[tid]->size = size;
+    (*fr->thrAllocData)[tid]->number = number;
+    (*fr->thrAllocData)[tid]->retptr = retptr;
 
-    cout << "read: " << PIN_ThreadId() << " 0x" << hex << setw(16) 
-	 << setfill('0') << addr << dec << " " << size << " " 
-	 << name << " " << source << endl;
+}
+
+VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
+{
+
+    if(!go)
+	return;
+
+    assert(fr->thrAllocData->size() > tid);
+    assert((*fr->thrAllocData)[tid]->calledFromAddr != 0);
+
+    if((*fr->thrAllocData)[tid]->retptr == 0)
+    {
+	/* The address of the allocated chunk is the 
+	   return value of the function */
+	(*fr->thrAllocData)[tid]->addr = addr;
+    }
+    else
+    {
+	/* The address of the allocated chunk is in the location pointed to 
+	 * by the retptr argument we received as the argument to the function
+	 */
+	PIN_SafeCopy( &((*fr->thrAllocData)[tid]->addr), 
+		      (const void*)(*fr->thrAllocData)[tid]->retptr, 
+		      KnobAppPtrSize/BITS_PER_BYTE);
+    }
+    
+    PIN_GetLock(&lock, PIN_ThreadId() + 1);
+    {
+	INT32 column = 0, line = 0;
+	string filename; 
+	string varname;
+
+	/* Let's get the source file and line */
+	PIN_LockClient();
+	PIN_GetSourceLocation((*fr->thrAllocData)[tid]->calledFromAddr, 
+			      &column, &line, &filename);
+	
+	PIN_UnlockClient();
+
+	if(filename.length() > 0 && line > 0)
+	    varname = 
+		findAllocVarName(filename, line, fr->name, fr->retaddr,
+				 *(fr->otherFuncProto));
+
+
+	/* Let's remember this allocation record */
+	{
+	  ADDRINT base = (*fr->thrAllocData)[tid]->addr;
+	  size_t size = (*fr->thrAllocData)[tid]->size * 
+	    (*fr->thrAllocData)[tid]->number;
+	  MemoryRange *mr = new MemoryRange(base, size);
+	  AllocRecord *ar = new AllocRecord(filename, line, varname);
+
+	  map<MemoryRange, AllocRecord>::iterator it =
+	    allocmap.find(*mr);
+	  
+	  if(it != allocmap.end())
+	    allocmap.erase(it);
+	
+	  allocmap.insert(make_pair(*mr, *ar));
+	
+	}
+	
+	cout << "alloc: " << tid 
+	     << " 0x" << hex << setfill('0') << setw(16) << (*fr->thrAllocData)[tid]->addr 
+	     << dec << " " << fr->name  
+	     << " " << (*fr->thrAllocData)[tid]->size << " " 
+	     << (*fr->thrAllocData)[tid]->number 
+	     << " " << filename 
+	     << ":" << line
+	     << " " << varname
+	     << endl; 
+	cout.flush();
+    }
+    PIN_ReleaseLock(&lock);
+
+    /* Since we are exiting the function, let's reset the
+     * "called from" address, to indicate that we are no longer
+     * in the middle of the function call. 
+     */
+    (*fr->thrAllocData)[tid]->calledFromAddr = 0;
+
+}
+
+VOID callBeforeAfterFunction(VOID *rtnAddr, VOID *eventType)
+{
+
+    PIN_GetLock(&lock, PIN_ThreadId() + 1);
+
+    {
+    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
+    
+    cout << (char*)eventType << " " << PIN_ThreadId() << " " 
+	 << name << endl;
+    }
+
     cout.flush();
     PIN_ReleaseLock(&lock);
 }
 
-// Print a memory write record
-VOID recordMemoryWrite(ADDRINT addr, UINT32 size, ADDRINT codeAddr, VOID *rtnAddr)
+VOID recordMemoryAccess(ADDRINT addr, UINT32 size, ADDRINT codeAddr, 
+		       VOID *rtnAddr, VOID *accessType)
 {
-    string filename;
-    INT32 column = 0, line = 0;
-    string source = "<unknown>";
 
     /* Don't track until we hit main() */
     if(!go)
 	return;
-
-    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
-
-    PIN_LockClient();
-    PIN_GetSourceLocation(codeAddr, &column, &line, &filename);
-    PIN_UnlockClient();
     
-    if(filename.length() > 0)
-    {
-        source = filename + ":" + to_string(line);
-    }
-
     PIN_GetLock(&lock, PIN_ThreadId()+1);
+    {
+	string filename;
+	INT32 column = 0, line = 0;
+	string source = "<unknown>";
 
-    cout << "write: " << PIN_ThreadId() << " 0x" << hex << setw(16) 
-	 << setfill('0') << addr << dec << " " << size << " " 
-	 << name << " " << source << endl;
+	string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
+    
+	PIN_LockClient();
+	PIN_GetSourceLocation(codeAddr, &column, &line, &filename);
+	PIN_UnlockClient();
+   
+	if(filename.length() > 0)
+	{
+	    source = filename + ":" + to_string(line);
+	}
+
+	/* Let's retrieve the allocation information for this access */
+	MemoryRange mr(addr, size);
+	map<MemoryRange, AllocRecord>::iterator it = allocmap.find(mr);
+
+	if(it != allocmap.end())
+	{
+	    cout << (char*)accessType << " " << PIN_ThreadId() << " 0x" << hex << setw(16) 
+		 << setfill('0') << addr << dec << " " << size << " " 
+		 << name << " " << source << " " << it->second.sourceFile
+		 << ":" << it->second.sourceLine << " " << it->second.varName << endl;
+	}
+	else
+	{
+	    cout << (char*)accessType << " " << PIN_ThreadId() << " 0x" << hex << setw(16) 
+		 << setfill('0') << addr << dec << " " << size << " " 
+		 << name << " " << source << endl;
+	}
+    }
     cout.flush();
     PIN_ReleaseLock(&lock);
 }
+
+
 
 /* ===================================================================== */
 /* Instrumentation routines                                              */
@@ -1092,11 +974,14 @@ VOID instrumentRoutine(RTN rtn, VOID * unused)
     /* Instrument entry and exit to the routine to report
      * function-begin and function-end events.
      */
-    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBeforeFunction,
-		   IARG_PTR, RTN_Address(rtn), IARG_END);
-    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)callAfterFunction,
-		   IARG_PTR, RTN_Address(rtn), IARG_END);
-
+    RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBeforeAfterFunction,
+		   IARG_PTR, RTN_Address(rtn), 
+		   IARG_PTR, fBeginStr, 
+		   IARG_END);
+    RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)callBeforeAfterFunction,
+		   IARG_PTR, RTN_Address(rtn), 
+		   IARG_PTR, fEndStr, 
+		   IARG_END);
 
     /* Insert instrumentation for each instruction in the routine */
     for(INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
@@ -1104,20 +989,24 @@ VOID instrumentRoutine(RTN rtn, VOID * unused)
 	if (INS_IsMemoryWrite(ins))
 	{
 	    INS_InsertPredicatedCall(ins, IPOINT_BEFORE, 
-				     (AFUNPTR)recordMemoryWrite,
+				     (AFUNPTR)recordMemoryAccess,
 				     IARG_MEMORYWRITE_EA, 
 				     IARG_MEMORYWRITE_SIZE, 
 				     IARG_PTR, INS_Address(ins), 
-				     IARG_PTR, RTN_Address(rtn), IARG_END);
+				     IARG_PTR, RTN_Address(rtn), 
+				     IARG_PTR, writeStr, 
+				     IARG_END);
 	}
 	if (INS_IsMemoryRead(ins))
 	{
 	    INS_InsertPredicatedCall(ins, IPOINT_BEFORE, 
-				     (AFUNPTR)recordMemoryRead,
+				     (AFUNPTR)recordMemoryAccess,
 				     IARG_MEMORYREAD_EA, 
 				     IARG_MEMORYREAD_SIZE, 
 				     IARG_PTR, INS_Address(ins), 
-				     IARG_PTR, RTN_Address(rtn), IARG_END);
+				     IARG_PTR, RTN_Address(rtn), 
+				     IARG_PTR, readStr, 
+				     IARG_END);
 	}
     }
 
@@ -1126,7 +1015,6 @@ VOID instrumentRoutine(RTN rtn, VOID * unused)
 
 VOID Image(IMG img, VOID *v)
 {
-    static int lastBreakPointID = 1;
 
     /* Find main. We won't do anything before main starts. */
     RTN rtn = RTN_FindByName(img, "main");
@@ -1136,7 +1024,6 @@ VOID Image(IMG img, VOID *v)
 	RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBeforeMain, IARG_END);
 	RTN_Close(rtn);
     }
-
 
     /* Go over all the allocation routines we are instrumenting and insert the
      * instrumentation.
@@ -1155,30 +1042,6 @@ VOID Image(IMG img, VOID *v)
 	    if((fr = findFuncRecord(&funcRecords, fp->name)) == NULL)
 	    {
 		fr = allocateAndAdd(&funcRecords, fp);
-
-		if(KnobWithGDB)
-		{
-		    /* Tell GDB to break on all alloc functions we are tracking. 
-		     * We are simply printing to stdout with a special prefix. 
-		     * A python script will parse that and pass everything after
-		     * the prefix as the command to the debugger. 
-		     */	
-		    cout << GDB_CMD_PFX << "break " << fr->name << endl << flush;
-		    cout << GDB_CMD_PFX << "commands " << endl << flush;
-		    cout << GDB_CMD_PFX << "next " << endl << flush;
-		    cout << GDB_CMD_PFX << "end " << endl << flush;	    
-
-		    /* We need to remember the breakpoint ID associated with this
-		     * function, because if we later learn that this function has
-		     * no line number information, then we would need to disable
-		     * this breakpoint. We know that the very first breakpoint we
-		     * will have is in main() -- #1. So the remaining breakpoints
-		     * will just be consecutive numbers after 1. 
-		     */
-		    fr->breakID = lastBreakPointID + 1;
-		    lastBreakPointID++;
-		    fr->noSourceInfo = 0;
-		}
 	    }
 
 
@@ -1240,7 +1103,7 @@ VOID Image(IMG img, VOID *v)
 
 	}
     }
-    
+   
     /* Now let's go over all the routines where we want to track 
      * the actual memory accesses and instrument them.
      */
@@ -1256,6 +1119,7 @@ VOID Image(IMG img, VOID *v)
 	    instrumentRoutine(rtn, 0);
 	}	    
     }
+
 }
 
 /* ===================================================================== */
@@ -1357,10 +1221,8 @@ bool parseFunctionList(const char *fname, vector<string> &list)
 
 VOID ThreadStart(THREADID threadid, CONTEXT *ctxt, INT32 flags, VOID *v)
 {
-    PIN_GetLock(&lock, threadid+1);
 
-    if(LOUD)
-	cout << "Thread " << threadid << " is starting " << endl;
+    cerr << "Thread " << threadid << " is starting " << endl;
 
     /* Thread IDs are monotonically increasing and are not reused
      * if a thread exits. */
@@ -1368,16 +1230,14 @@ VOID ThreadStart(THREADID threadid, CONTEXT *ctxt, INT32 flags, VOID *v)
 
     for(FuncRecord *fr: funcRecords)
     {
-	while(fr->thrAllocData.size() < (threadid + 1))
+	while(fr->thrAllocData->size() < (threadid + 1))
 	{
 
 	    ThreadAllocData *tr = new ThreadAllocData();
-	    initThreadAllocData(tr);
-	    fr->thrAllocData.push_back(tr);
+	    memset(tr, 0, sizeof(ThreadAllocData));
+	    fr->thrAllocData->push_back(tr);
 	}
     }
-
-    PIN_ReleaseLock(&lock);
 }
 
 VOID Fini(INT32 code, VOID *v)
@@ -1397,8 +1257,10 @@ int main(int argc, char *argv[])
     PIN_InitSymbols();
     if( PIN_Init(argc,argv) )
     {
-        return Usage();
+	return Usage();
     }    
+    
+    PIN_InitLock(&lock);
 
     selectiveInstrumentation = 
 	parseFunctionList(KnobTrackedFuncsFile.Value().c_str(), TrackedFuncsList);
@@ -1416,11 +1278,6 @@ int main(int argc, char *argv[])
     IMG_AddInstrumentFunction(Image, 0);
     PIN_AddThreadStartFunction(ThreadStart, 0);
     PIN_AddFiniFunction(Fini, 0);
-
-    PIN_InitLock(&lock);
-
-    if(KnobWithGDB)
-	cout << "Assuming a concurrent GDB session " << endl;
 
     // Never returns
     PIN_StartProgram();

@@ -14,11 +14,7 @@ from multiprocessing import Process
 # This dictionary contains all
 # memory allocations that we encounter
 
-memAllocations = {}
 processes = []
-
-def i2u(i):
-    return ctypes.c_uint32(i).value
 
 def notValidHex(num):
     
@@ -28,33 +24,6 @@ def notValidHex(num):
     except:
         return True;
 
-class MemoryRange:
-
-    def __init__(self, base, size):
-        self.strBase = base;
-        self.strSize = size;
-        self.base = i2u(int(base, 16));
-        self.size = i2u(int(size));
-
-
-    # We consider two memory ranges equal if one
-    # contains the other
-    #
-    def __eq__(self, other):
-
-        if(self.base <= other.base and
-           (self.base + self.size) >= other.base):
-            return True;
-        if(self.base >= other.base and
-           self.base <= (other.base + other.size)):
-            return True;
-        return False;
-
-    def __hash__(self):
-        return self.base;
-
-    def __str__(self):
-        return ("["+ self.strBase + ", " + self.strSize + "]");
 
 class AllocRecord:
 
@@ -139,31 +108,6 @@ class FuncRecord:
                "\"name\": \"" + self.funcName + "\"}");
 
 
-def findOverlappingAlloc(memAllocations, alloc):
-
-    for r in memAllocations.keys():
-        # Relying on a custom comparison
-        # function to tell us is one memory
-        # range overlaps with another
-        #
-        if(r == alloc):
-            return r;
-
-    return None;
-
-def findMatchingAllocation(memAllocations, memRange):
-
-    for r in memAllocations.keys():
-        # Relying on a custom comparison
-        # function to tell us is one memory
-        # range overlaps with another
-        #
-        if(r == memRange):
-            return memAllocations[r];
-
-    return None;
-
-
 def parseAlloc(line, out):
 
     threadID = "<unknown>";
@@ -202,21 +146,6 @@ def parseAlloc(line, out):
                 sourceLoc, varName, varType);
 
     out.write(str(r) + "\n");
-
-    # Add this memory allocation to the dictionary
-    # First check if one with an overlapping range already exists. 
-    # If so, we assume it was freed (we don't track frees yet)
-    # and delete it. 
-    #
-    alloc = MemoryRange(addr, str(int(size) * int(numItems)));
-    existingAlloc = findOverlappingAlloc(memAllocations, alloc);
-
-    if(existingAlloc is not None):
-        sys.stderr.write("Allocation " + str(alloc) + 
-                         " overlaps with " + str(existingAlloc) + "\n");
-        del memAllocations[existingAlloc];
-        
-    memAllocations[alloc] = r;
 
 
 def parseMemoryAccess(line, out):
@@ -258,23 +187,9 @@ def parseMemoryAccess(line, out):
                      varName, varType, allocLoc);
     
     if(notValidHex(addr)):
-        print "Corrupted record: "
-        print line
+        sys.stderr.write("Corrupted record: \n")
+        sys.stderr.write(line)
         return;
-
-    # Let's create a MemoryRange object to see if
-    # there is a memory allocation corresponding to
-    # this access. If so, we pull the corresponding
-    # source location and variable information and 
-    # add it to the record
-    #
-    m = MemoryRange(addr, size);
-    allocRecord = findMatchingAllocation(memAllocations, m);
-
-    if(allocRecord is not None):
-        r.varName = allocRecord.varName;
-        r.varType = allocRecord.varType;
-        r.allocLoc = allocRecord.sourceLoc;
 
     out.write(str(r) + "\n");
 
