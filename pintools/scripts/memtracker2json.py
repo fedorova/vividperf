@@ -178,11 +178,12 @@ def parseMemoryAccess(line, out):
         if(i == 5):
             sourceLoc = words[i];
         if(i == 6):
-            varName = words[i];
-        if(i == 7):
-            varType = words[i];    
-        if(i == 8):
             allocLoc = words[i];
+        if(i == 7):
+            varName = words[i];
+        if(i == 8):
+            varType = words[i];    
+
 
     r = AccessRecord(accessType, threadID, addr, size, funcName, sourceLoc,
                      varName, varType, allocLoc);
