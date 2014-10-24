@@ -1,92 +1,23 @@
-# In this file we specify the alloc
-# functions that we want to be tracked. 
-# 
-# Each non-blank line that is NOT
-# pre-fixed by a # or ! contains a function
-# specification. A function specification is
-# quadruplet consisting of one string and three
-# numbers.
-# 
-# The string is the name of the function
-# exactly as it appears in the source code. 
-# 
-# The numbers describe the semantics of the 
-# alloc function's arguments and return values. 
-# We assume that arguments are numbered starting
-# from 0. 
-# 
-# The first number tells us which argument of the
-# alloc function specifies the number of elements
-# to allocate. For example, in Posix calloc function
-# 0th argument is the number of elements. (See example
-# below). 
-#
-# Some functions, such as Posix malloc, do not specify the
-# number of items to allocate, they always assume that
-# you allocate only one item. In that case, the first
-# number should be "-1".  (See example below).
-#
-# The second number tells us which argument provides the
-# size of the allocated element. For instance, for Posix
-# malloc, it's the 0th argument (see example below). For
-# Posix calloc, it's the first argument. 
-#
-# Finally, the third number tells us where to look for the 
-# address of the allocated variable. If the address is
-# returned by the function, as in malloc and calloc, we
-# specify "-1". If the function assigns the value of the allocated
-# pointer into a location that was provided as an argument
-# (as in the __wt_calloc function below), we specify the index
-# of the argument specifying that location: #3 in our case
-# to imply the fourth argument. 
-#
-# 
-# If a function specification is followed 
-# by one or more lines beginning with a !,
-# then this means that
-# this function might optionally be wrapped
+# A function followed by one or more
+# lines beginning with a ! means that
+# this function might be wrapped
 # in a macro with a different signature
 # than the function itself. 
-# We need to keep track of this "alternative 
-# function prototypes for the purposes of parsing
-# argument names and types. 
+# We need to keep track of this for
+# parsing the argument types. 
 #
-# If your program wraps alloc function calls into other functions
-# or macros and you want memtracker to gather the names 
-# (and optionally types) of the allocated variables, you need to 
-# specify the signature of the function that actually contains the
-# name of the allocated symbol: either assigns the return value to it
-# or specifies it as the argument. 
-#
-# For instance, suppose you have the following code:
-#
-# void *
-# my_alloc(int size)
-# {
-#      return malloc(size);
-# }
-#
-# int main(void)
-#{
-#      char* buffer = my_alloc(100);
-#}
-#
-# If you ask memtracker to track "malloc", it will have no
-# way of knowing that malloc was used to allocate char* buffer. 
-# But if you ask it to track my_alloc, then it will be able to 
-# determine that you have actually allocated a character array
-# called "buffer". Then, as you access this array later in your
-# program, memtracker trace will have enough information to 
-# determine which memory accesses correspond to that character
-# buffer. 
-# 
-# Below is a sample function specification.
+# In the specification of this alternative function
+# prototype we only care to know which argument is
+# the name of the allocated variable. So for 
+# the alternative prototypes it is safe to put
+# "-1" in the "number" and "size" positions. 
 #
 # func                number   size   addr
 #
 __wt_calloc              1       2     3 
 !__wt_calloc_def         1      -1     2
 !__wt_block_size_alloc  -1      -1     1 
-__wt_realloc            -1       2     3
+!__bit_alloc            -1      -1     2
 #malloc                 -1       0    -1
-#calloc                  0       1    -1
+__wt_realloc            -1       2     3
+!__wt_realloc_def       -1      -1     3

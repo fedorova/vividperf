@@ -554,7 +554,10 @@ string findAllocVarName(string file, int line, string func, int arg,
     {
 	getline(sourceFile, lineString);
 	if(fileError(sourceFile, file, line))
-	   return "";	   
+	{
+	    var = "";
+	    goto done;
+	}
 	lineBuffer[++bufferPos%MAXLINES].assign(lineString);
     }
 
@@ -606,7 +609,10 @@ string findAllocVarName(string file, int line, string func, int arg,
 	     * find the function there */
 	    getline(sourceFile, lineString);
 	    if(fileError(sourceFile, file, line))
-		return "";	   
+	    {
+		var = "";
+		goto done;
+	    }
 	    lineBuffer[++bufferPos%MAXLINES].assign(lineString);
 	}
     }
@@ -870,8 +876,17 @@ VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
 	    allocmap.find(*mr);
 	  
 	  if(it != allocmap.end())
-	    allocmap.erase(it);
-	
+	  {
+	      /* If we found an allocation in the same range as the
+	       * new one, chances are someone has freed that allocation.
+	       * We don't support tracking of "free" calls yet, so let's
+	       * output an "implicit" free record.
+	       */
+	      cout << "implicit-free: " 
+		   << " 0x" << hex << setfill('0') << setw(16) << it->first.base << endl;
+	      allocmap.erase(it);
+	  }
+
 	  allocmap.insert(make_pair(*mr, *ar));
 	
 	}
