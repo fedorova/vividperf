@@ -187,6 +187,25 @@ typedef struct func_record
 vector<FuncRecord*> funcRecords;
 unsigned int largestUnusedThreadID = 0;
 
+/* 
+ * A vector with per-thread flags specifying whether the thread is
+ * executing inside one of the functions that we want to track. 
+ * Having an array or a bitmap would be faster, but this is by far
+ * not the bottleneck in this heavy-weight tracing tool, so we opt
+ * for easier programmability and just use a vector. 
+ *
+ * While it would be logical to use a vector<bool>, we don't because
+ * the implementation of vector<bool> is less thread-safe than the standard vector
+ * implementation. 
+ */
+
+typedef enum {
+    NO,
+    YES
+} intracked_flag_t;
+
+vector<intracked_flag_t> inTracked;
+
 
 /* ===================================================================== */
 /* Helper routines                                                       */
@@ -926,10 +945,33 @@ VOID callBeforeAfterFunction(VOID *rtnAddr, func_event_t eventType)
     PIN_GetLock(&lock, PIN_ThreadId() + 1);
 
     {
-    string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
-    
-    cout << (char*)funcEventNames[eventType] << " " << PIN_ThreadId() << " " 
-	 << name << endl;
+	string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
+	THREADID tid = PIN_ThreadId();
+	bool tracked = false; 
+
+	/* Find out if this function is in the list of
+	 * the functions that the user wants tracked
+	 */
+	for (string trackedFname: TrackedFuncsList)
+	{
+	    if(trackedFname.compare(name) == 0)
+		tracked = true;
+	}
+	
+	/* Set the flag for the current thread telling it
+	 * whether or not we want to track memory accesses within
+	 * this function and whether or not we want to print enter/exit
+	 * events.
+	 */
+	if(tracked)
+	{
+	    cout << (char*)funcEventNames[eventType] << " " << PIN_ThreadId() << " " 
+		 << name << endl;
+	    if(eventType == FUNC_BEGIN)
+		inTracked[tid] = YES;
+	    else
+		inTracked[tid] = NO;
+	}
 
     }
 
@@ -943,6 +985,9 @@ VOID recordMemoryAccess(ADDRINT addr, UINT32 size, ADDRINT codeAddr,
 
     /* Don't track until we hit main() */
     if(!go)
+	return;
+
+    if(inTracked[PIN_ThreadId()] == NO)
 	return;
     
     PIN_GetLock(&lock, PIN_ThreadId()+1);
@@ -1146,24 +1191,7 @@ VOID Image(IMG img, VOID *v)
 	    RTN_Close(rtn);
 
 	}
-    }
-   
-    /* Now let's go over all the routines where we want to track 
-     * the actual memory accesses and instrument them.
-     */
-    if(selectiveInstrumentation)
-    {
-	for (string fname: TrackedFuncsList)
-	{
-	    RTN rtn = RTN_FindByName(img, fname.c_str());
-	    
-	    if (!RTN_Valid(rtn))
-		continue;
-	    cout << "Procedure " << fname << " located." << endl;
-	    instrumentRoutine(rtn, 0);
-	}	    
-    }
-
+    }   
 }
 
 /* ===================================================================== */
@@ -1267,10 +1295,15 @@ VOID ThreadStart(THREADID threadid, CONTEXT *ctxt, INT32 flags, VOID *v)
 {
 
     cerr << "Thread " << threadid << " is starting " << endl;
+    cout << "Thread " << threadid << " is starting " << endl;
 
     /* Thread IDs are monotonically increasing and are not reused
      * if a thread exits. */
     largestUnusedThreadID = threadid+1;
+
+    /* Grow the inTracked vector according to the number of threads.*/
+    if(threadid == inTracked.size())
+	inTracked.push_back(NO);
 
     for(FuncRecord *fr: funcRecords)
     {
@@ -1321,10 +1354,15 @@ int main(int argc, char *argv[])
     /* Instrument tracing memory accesses */
     INS_AddInstrumentFunction(Instruction, 0);
 
-
     IMG_AddInstrumentFunction(Image, 0);
     PIN_AddThreadStartFunction(ThreadStart, 0);
     PIN_AddFiniFunction(Fini, 0);
+
+    /* Once we run we are going to have at least one thread
+     * so add a boolean flag to the vector of per-thread flags 
+     * indicating whether we are inside a tracked function
+     */
+    inTracked.push_back(NO);
 
     // Never returns
     PIN_StartProgram();
