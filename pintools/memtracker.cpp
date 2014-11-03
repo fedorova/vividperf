@@ -51,8 +51,16 @@ bool LOUD = false;
 bool go = false;
 bool selectiveInstrumentation = false;
 
+/*
 char fBeginStr[] = "function-begin:";
 char fEndStr[] = "function-end:";
+*/
+typedef enum{
+    FUNC_BEGIN,
+    FUNC_END
+} func_event_t;
+
+char *funcEventNames[2] = {"function-begin:", "function-end:"};
 
 char readStr[] = "read:";
 char writeStr[] = "write:";
@@ -912,7 +920,7 @@ VOID callAfterAlloc(FuncRecord *fr, THREADID tid, ADDRINT addr)
 
 }
 
-VOID callBeforeAfterFunction(VOID *rtnAddr, VOID *eventType)
+VOID callBeforeAfterFunction(VOID *rtnAddr, func_event_t eventType)
 {
 
     PIN_GetLock(&lock, PIN_ThreadId() + 1);
@@ -920,8 +928,9 @@ VOID callBeforeAfterFunction(VOID *rtnAddr, VOID *eventType)
     {
     string name = RTN_FindNameByAddress((ADDRINT)rtnAddr);
     
-    cout << (char*)eventType << " " << PIN_ThreadId() << " " 
+    cout << (char*)funcEventNames[eventType] << " " << PIN_ThreadId() << " " 
 	 << name << endl;
+
     }
 
     cout.flush();
@@ -991,42 +1000,62 @@ VOID instrumentRoutine(RTN rtn, VOID * unused)
      */
     RTN_InsertCall(rtn, IPOINT_BEFORE, (AFUNPTR)callBeforeAfterFunction,
 		   IARG_PTR, RTN_Address(rtn), 
-		   IARG_PTR, fBeginStr, 
+		   IARG_UINT32, FUNC_BEGIN, 
 		   IARG_END);
     RTN_InsertCall(rtn, IPOINT_AFTER, (AFUNPTR)callBeforeAfterFunction,
-		   IARG_PTR, RTN_Address(rtn), 
-		   IARG_PTR, fEndStr, 
+		   IARG_PTR, RTN_Address(rtn),
+		   IARG_UINT32, FUNC_END,  
 		   IARG_END);
-
-    /* Insert instrumentation for each instruction in the routine */
-    for(INS ins = RTN_InsHead(rtn); INS_Valid(ins); ins = INS_Next(ins))
-    {
-	if (INS_IsMemoryWrite(ins))
-	{
-	    INS_InsertPredicatedCall(ins, IPOINT_BEFORE, 
-				     (AFUNPTR)recordMemoryAccess,
-				     IARG_MEMORYWRITE_EA, 
-				     IARG_MEMORYWRITE_SIZE, 
-				     IARG_PTR, INS_Address(ins), 
-				     IARG_PTR, RTN_Address(rtn), 
-				     IARG_PTR, writeStr, 
-				     IARG_END);
-	}
-	if (INS_IsMemoryRead(ins))
-	{
-	    INS_InsertPredicatedCall(ins, IPOINT_BEFORE, 
-				     (AFUNPTR)recordMemoryAccess,
-				     IARG_MEMORYREAD_EA, 
-				     IARG_MEMORYREAD_SIZE, 
-				     IARG_PTR, INS_Address(ins), 
-				     IARG_PTR, RTN_Address(rtn), 
-				     IARG_PTR, readStr, 
-				     IARG_END);
-	}
-    }
 
     RTN_Close(rtn);
 }
+
+// Is called for every instruction and instruments reads and writes
+VOID Instruction(INS ins, VOID *v)
+{
+    /* Instruments memory accesses using a predicated call, i.e.
+     * the instrumentation is called iff the instruction will actually be executed.
+     *
+     * On the IA-32 and Intel(R) 64 architectures conditional moves and REP 
+     * prefixed instructions appear as predicated instructions in Pin.
+     */
+    UINT32 memOperands = INS_MemoryOperandCount(ins);
+    ADDRINT insAddr = INS_Address(ins);
+    RTN rtn = RTN_FindByAddress(insAddr);
+
+    // Iterate over each memory operand of the instruction.
+    for (UINT32 memOp = 0; memOp < memOperands; memOp++)
+    {
+        if (INS_MemoryOperandIsRead(ins, memOp))
+        {
+            INS_InsertPredicatedCall(
+                ins, IPOINT_BEFORE, (AFUNPTR)recordMemoryAccess,
+		IARG_MEMORYOP_EA, memOp, 
+		IARG_MEMORYREAD_SIZE, 
+		IARG_INST_PTR,
+		IARG_PTR, RTN_Address(rtn),
+		IARG_PTR, readStr, 
+                IARG_END);
+
+        }
+        // Note that in some architectures a single memory operand can be 
+        // both read and written (for instance incl (%eax) on IA-32)
+        // In that case we instrument it once for read and once for write.
+        if (INS_MemoryOperandIsWritten(ins, memOp))
+        {
+            INS_InsertPredicatedCall(
+                ins, IPOINT_BEFORE, (AFUNPTR)recordMemoryAccess,
+		IARG_MEMORYOP_EA, memOp, 
+		IARG_MEMORYWRITE_SIZE, 
+		IARG_INST_PTR,
+		IARG_PTR, RTN_Address(rtn),
+		IARG_PTR, writeStr, 
+                IARG_END);
+
+        }
+    }
+}
+
 
 VOID Image(IMG img, VOID *v)
 {
@@ -1277,18 +1306,21 @@ int main(int argc, char *argv[])
     
     PIN_InitLock(&lock);
 
+    /* If the user wants to trace only the specific function (and whatever is
+     * called from them), they would provide a list of functions of interest. 
+     * TODO: Implement support for this. 
+     */
     selectiveInstrumentation = 
 	parseFunctionList(KnobTrackedFuncsFile.Value().c_str(), TrackedFuncsList);
     parseFunctionList(KnobAllocFuncsFile.Value().c_str(), AllocFuncsList);
     parseAllocFuncsProto(AllocFuncsList);
 
-    /* The selectiveInstrumentation flag tells us
-     * whether we want to instrument only selected
-     * functions for memory accesses. If it is false, 
-     * this means we want to instrument everything.
-     */
-    if(!selectiveInstrumentation)
-	RTN_AddInstrumentFunction(instrumentRoutine, 0);
+    /* Instrument all functions to output when they begin and end */
+    RTN_AddInstrumentFunction(instrumentRoutine, 0);
+
+    /* Instrument tracing memory accesses */
+    INS_AddInstrumentFunction(Instruction, 0);
+
 
     IMG_AddInstrumentFunction(Image, 0);
     PIN_AddThreadStartFunction(ThreadStart, 0);
