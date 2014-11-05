@@ -1,4 +1,6 @@
-To compile pintools, download and unpack the pin toolkit from the Intel's website: 
+
+
+To compile the pintools, download and unpack the pin toolkit from the Intel's website: 
 http://software.intel.com/en-us/articles/pin-a-dynamic-binary-instrumentation-tool
 
 Set the PIN_ROOT environmental variable to point to the root  directory of the toolkit. 
@@ -14,88 +16,160 @@ Tool descriptions are provided below. The name in paretheses is the name of the 
 Tools:
 
 =====================================================
-memtracker.so (memtracker.sh, memtracker-with-gdb.sh)
+memtracker.so (memtracker.sh)
 =====================================================
 
-This tool tracks memory accesses and memory allocations. It prints out a trace of allocation and access records. Here is an example of what you might see:
+This tool tracks memory allocations, memory accesses and function entry/exit points for C programs and the associated libraries. It prints out a trace of allocation and access records. 
 
-alloc: 0x00007f3a858d1c51 my_alloc 6 0x00007f3a7c000990 632 1 /cs/systems/home/fedorova/Work/my_example.c:380 BT_NODE * node
+The tool has some nice features enabling it to work with real production code. 
 
-write: 6 0x00007f3a80d70960 8 main
-write: 6 0x00007f3a80d70958 8 main
-write: 6 0x00007f3a80d70950 8 main
-write: 6 0x00007f3a80d70948 8 main
+* It does not require changes to the source code of your program. 
+* It can track any memory allocation function or macro (not just malloc). You specify the prototype of your memory allocation functions in a configuration file. 
+* It works for multithreaded programs. 
+* It tracks source location of memory accesses (for binaries with debug information) and the names of the accessed variables (for variables allocated on the heap via the tracked allocation functions you identified). 
 
-An allocation record gives us:
-* The code address where the allocation was performed
-* The name of the allocation function
-* The ID of the thread that performed the allocation
-* The allocated address
-* The size of the allocation
-* The number of allocated objects (for functions like calloc)
-* The location in the source code
-* Variable type (optional)
-* Variable name
+Here is an excerpt from a trace that memtracker collects:
 
-Allocation records are printed only if the debug information is available. 
+read: 0 0x00007fff802a1bc0 8 calloc <unknown>
+function-end: 0 calloc
+alloc: 0 0x0000000001ccef10 __wt_calloc 3776 1 /cs/systems/home/fedorova/Work/WiredTiger/wt-dev/build_posix/../src/conn/conn_api.c:1216 conn
+function-end: 0 __wt_calloc
+read: 0 0x00007f771eefcf38 8 wiredtiger_open /cs/systems/home/fedorova/Work/WiredTiger/wt-dev/build_posix/../src/include/mutex.i:172
+write: 0 0x0000000001ccef10 8 wiredtiger_open /cs/systems/home/fedorova/Work/WiredTiger/wt-dev/build_posix/../src/conn/conn_api.c:1217 /cs/systems/home/fedorova/Work/WiredTiger/wt-dev/build_posix/../src/conn/conn_api.c:1216 conn
 
-The access record gives us:
-* The type of an access (read or write)
-* The ID of the thread that performed the access
-* The address that was accessed
-* The size of the access
-* The name of the function that performed the access.
+In this example we see five different record types:
+
+1) Allocation record
+2) Function delimiter record
+3) Memory access record without call-site information 
+4) Memory access record with call-site information, but without data-source information
+5) Memory access record with call-site information and with data-source information
+
+Let's go into detail of what these records show.
+
+1. Allocation record 
+
+This record type is prefixed with "alloc:" and has the following fields:
+
+* thread id
+* allocated address
+* size of the allocation
+* number of items
+* source file and line from which the allocation was made
+* the name of the variable for which we allocated space.
+
+2. Function delimiter record
+
+Prefixed with "function-begin:" or "function-end:". The fields are:
+
+* thread id
+* function name
+
+3. Memory access record without call-site information 
+
+Prefixed with "read:" or "write:". The fields are:
+
+* thread id
+* memory address 
+* size of the accessed data
+* function from which the access is made
+* <unknown> to indicate that we could not obtain the source file/line information
+
+An example of such a record is the first one in the above trace excerpt.
+
+4. Memory access record with call-site information, but without data-source information
+
+This record has the same format as the type 3 above, but the last field contains the source file/line of the access instead of <unknown>. The fifth record in the above excerpt is an example of such a record. 
+
+5. Memory access record with call-site information and with data-source information
+
+This record is the same as the type 4 above, but we have two additional fields at the end:
+
+* the source code location of the dynamic memory allocation corresponding to this access
+* the name of the variable to which this access is made. 
 
 HOW TO USE THE TOOL:
 
-To see how to launch the tool, take a look at the script memtracker.sh for an example.
+** Running:
 
-If you want to know the types of allocated variables, you need to run with gdb and use the script memtracker-with-gdb.sh for an example. 
+pin.sh -t $CUSTOM_PINTOOLS_HOME/obj-intel64/memtracker.so -- <your program with arguments>
 
-The tool assumes that the user provides two input files: alloc.in and memtracker.in. These are the file names assumed by default, and their assumed location is the same directory where the tool is invoked. 
+For an example of the actual working script that launches this tool with a WiredTiger library running the LevelDB benchmark, take a look at scripts/memtracker.sh.
 
-alloc.in provides a list of alloc functions that you want to track. See a sample alloc.in in this repository (scripts directory) for the explanation of the expected format. 
+** Configuring:
 
-The other file, memtracker.in, tells the tool the names of the functions in which you want to track the memory accesses. If you want to track everything, this file needs to contain a line with a '*' on it and nothing else. If you do not want to trace the entire program, but isolate your analysis to a problematic function (or functions), specify the function names you want to track, one per line. Lines starting with a '#' are ignored, so you can add comments on lines prefixed with a '#'.  See a sample memtracker.in in this repository (scripts directory) for the explanation of the expected format. 
+There are two sets of configurations that memtracker accepts:
 
-HOW THE TOOL OBTAINS VARIABLE NAMES AND TYPES:
+1) Limiting the scope of tracking memory accesses
+2) Configuration of memory allocation functions
 
-We get the name of the allocated variable by parsing the source file. The source location of the call to the alloc function can be obtained from within a Pintool. In most cases, the name of the variable is sufficient to identify the allocated object, because most programmers give their variables intuitive names. For instance, if you called a variable "node", you can guess that it is of type "BT_NODE", if this type is defined in your program. However, if desired, we can also obtain variable types. 
+1. Limiting the scope of tracking memory accesses
 
-The way we get the type of the allocated variable is kind of arcane and ugly. I think this needs to be redesigned, but I do not have time, so here it is. Basically, the most quick and dirty way to implement this was to get the type via gdb, by using it's "whatis" command. We use gdb as follows:
+Tracking every memory access in the entire program is very expensive. It will produce very large traces (roughly 1GB for every second of single-threaded execution) and will significantly slow down the program (more than 10,000 times). To limit these effects, you may opt to track memory accesses only within a function of interest (and its descendants). For instance, if you determined by profiling your code that function foo() slows down when run with multiple threads and you want to see whether there is some true or false sharing that is responsible for the slowdown, you can tell the memtracker to only track memory accesses in foo() and its descendants. 
 
-(See memtracker-with-gdb.sh for an actual example.)
+To do so, you use the -f option to the pintool and provide the file name that has the names of the functions of interest. For example, suppose you put your problematic functions in the file funcs.in. Then you would invoke the tool as follows: 
 
-1) Start a gdb session providing the application binary as the argument and set it up so it reads its command from a file gdb-cmd.txt.
-2) Concurrently have the memtracker launch the application using the "appdebug" mode, that is,
-allowing gdb to attach to the application that is running inder a pintool.
-3) Pipe the output from memtracker to the python script called memtracker-gdb-driver.py: let us call
-it simply the GDB driver.
-4) The GDB driver will take gdb commands from the tool's output (anything prefixed with "gdb:",
-plus the initial pintool message specifying on which port to attach to the application)
-and will write them to gdb-cmd.txt.
-5) The GDB session will take the commands and execute them. 
+pin.sh -t $CUSTOM_PINTOOLS_HOME/obj-intel64/memtracker.so -f funcs.in -- <your program with arguments>
 
-We set a gdb breakpoint before every memory allocation function. Once that breakpoint is hit, we parse the source to find out the name of the variable, let's call it "varname", and then pass to gdb the command:
+By default, memtracker looks for the scope-limiting functions in the file memtracker.in (located in the working directory) even if you don't use the -f option. 
 
-   whatis varname
+For an example of a valid configuration file, take a look at scripts/memtracker.in.
 
-Gdb then outputs the type of the variable to the file gdb-out.txt.
-If the tool already asked gdb for a variable type, it doesn't ask it again, because we already have that information. 
+2. Configuration of memory allocation functions
 
-At the end of the run, the script memtracker-process-raw.py takes the files log.txt (which is where memtracker prints allocation records -- that file contains everything except variable types) and gdb-out.txt (which contains variable types) and merges them into a unified data structure. 
+You need to describe to memtracker the prototypes of the memory allocation functions used in your program. Why? Memtracker will need to know the address of the allocated variable, the size of the allocation and the number of allocated items (for calloc-like functions). It takes this information by reading the arguments and return values of the memory allocation function. To interpret these values correctly, it needs to know: is the allocated address returned from the function call or is it written to a memory location pointed to by a pointer argument and, if so, which argument? which argument specifies the size of the allocation? 
 
-So you can see how arcane this is. Doing this dance with gdb is also a huge hit on the tool's performance. A much better way would be to learn the variable type by doing more parsing on the source file, but I do not plan to do this, because I believe that in most cases knowing variable type does not buy us much once we know the variable name. Plus, I don't have time. So there you have it. 
+By default, memtracker looks for allocation function prototypes in the file alloc.in in the current working directory. Alternatively, you can provide your own file name with the -a option to the pintool as follows:
 
-IMPORTANT FEATURES:
+pin.sh -t $CUSTOM_PINTOOLS_HOME/obj-intel64/memtracker.so -a my_alloc_prototypes.in -- <your program with arguments>
 
-Apart from the gdb madness, the tool has some nice features enabling it to work with real productioncode. 
+Memtracker expects to find the prototypes of the allocation functions in the following format (one function per line):
 
-* It does not require changes to the source code of your program. 
-* It can track alternative alloc functions (not just malloc). In the input file (default is alloc.in) you specify the names of the allocation functions you want to track and their prototypes. So if your allocation function allocates multiple items at once (like calloc) or puts the allocated address in the in-out pointer argument -- memtracker supports that. Read an example file alloc.in to understand how to specify the allocation functions. 
 
-Sometimes your alloc function might be wrapped in a macro, possibly giving this function an alternative prototype. You need to specify all such alternative prototypes for a function in alloc.in, otherwise memtracker will not be able to parse the variable name in cases where the allocation function is invoked via a macro.
+	   <func_name>	   <arg_id_of_number> <arg_id_of_size> <arg_id_of_addr>
 
+where:
+
+<func_name> -- a function name
+<arg_id_of_number> -- argument id of the number of allocated items or -1
+		   if your alloc function does not use such an argument 
+<arg_id_of_size> -- argument id of the size of the allocation
+<arg_id_of_addr> -- argument id of the pointer to the location where the allocated
+		 address will be stored or -1 if the address is returned by the
+		 function. 
+
+arg_id is the index of the corresponding argument passed into the allocation function. We assume that the very first argument has id 0.
+
+For example, consider the following valid alloc.in file:
+
+
+# func                number   size   addr
+#
+malloc                  -1       0    -1
+__wt_calloc              1       2     3 
+
+
+Here we see two function signatures: the conventional malloc from libc and an application-specific allocation function __wt_calloc. Let's walk through these signatures to understand their specification. Malloc does not use the number of allocations in its arguments, so we put "-1" in the <arg_id_of_number> field (the first value after the function name). The size of the allocation is the first argument to malloc, so we put "0" into the <arg_id_of_size> field. The address of the allocation is returned by malloc, so we put "-1" into the <arg_id_of_addr>.
+
+__wt_calloc, on the other hand, expects to receive the number of allocated items as the second argument, so we put "1" into the <arg_id_of_number> field. The size of each item is provided in the third argument so we put "2" into the <arg_id_of_size>. The allocated address is placed into a memory location pointed to by the fourth argument, so we put "3" into the <arg_id_of_addr> field. 
+
+** What if your allocation functions are wrapped by a macro? 
+
+Real-world code sometimes wraps memory-allocation functions into a macro. That would present a problem for memtracker when it attempts to identify the name of the variable for which the function allocates space. Memtracker parses the source file where the allocation function is called, but if it is wrapped in the macro, it will not find it there, because it will be replaced with the name of the macro. To fix this problem, we ask the user to provide the names of the macros (if any) that might be used as wrappers for memory allocation functions. Suppose that __wt_calloc function from the above example can be wrapped in one of three macros. Then, we would specify their names as follows:
+
+# func                number   size   addr
+#
+malloc                  -1       0    -1
+__wt_calloc              1       2     3 
+!__wt_calloc_def         1      -1     2
+!__wt_block_size_alloc  -1      -1     1 
+!__bit_alloc            -1      -1     2
+
+You see three additional records here corresponding to the __wt_calloc-wrapping macros. They appear directly under the signature for __wt_calloc (this is required) and are prefixed with an "!". Other than that, they have the same format as the simple function-signature record, except the fields <arg_id_of_number> and <arg_id_of_size> are not used. We only care about <arg_id_of_addr>.
+
+IMPORTANT NOTES:
+
+If you want memtracker to be able to find the source location of memory accesses and allocations, compile your code with debug symbols. If you want memtracker to be able to find the names of dynamically allocated variables, run your program (under the pintool) on the same system where you compiled your program and don't remove or move the source files.
 
 ==================
 null.so (null.sh)
