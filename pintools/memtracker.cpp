@@ -53,10 +53,6 @@ bool selectiveInstrumentation = false;
 
 unsigned long STACK_BASE = 0x0000700000000000;
 
-/*
-char fBeginStr[] = "function-begin:";
-char fEndStr[] = "function-end:";
-*/
 typedef enum{
     FUNC_BEGIN,
     FUNC_END
