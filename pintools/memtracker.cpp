@@ -51,6 +51,8 @@ bool LOUD = false;
 bool go = false;
 bool selectiveInstrumentation = false;
 
+unsigned long STACK_BASE = 0x0000700000000000;
+
 /*
 char fBeginStr[] = "function-begin:";
 char fEndStr[] = "function-end:";
@@ -84,6 +86,9 @@ KNOB<string> KnobAllocFuncsFile(KNOB_MODE_WRITEONCE, "pintool",
 
 KNOB<int> KnobAppPtrSize(KNOB_MODE_WRITEONCE, "pintool",
 				"p", "64", "application pointer size in bits (default is 64)");
+
+KNOB<bool> KnobTrackStackAccesses(KNOB_MODE_WRITEONCE, "pintool",
+				"s", "false", "Include stack memory accesses into the trace. Default is false. ");
 
 
 /* ===================================================================== */
@@ -989,6 +994,10 @@ VOID recordMemoryAccess(ADDRINT addr, UINT32 size, ADDRINT codeAddr,
 	return;
 
     if(inTracked[PIN_ThreadId()] == NO)
+	return;
+
+    if(!KnobTrackStackAccesses &&
+       addr > STACK_BASE)
 	return;
     
     PIN_GetLock(&lock, PIN_ThreadId()+1);
