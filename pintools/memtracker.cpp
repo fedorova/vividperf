@@ -55,8 +55,7 @@ bool LOUD = false;
 bool go = false;
 bool selectiveInstrumentation = false;
 
-int get_process_stack(pid_t pid);
-int get_thread_stacks(pid_t pid, pid_t tid);
+void get_process_stack(pid_t pid);
 void get_and_refresh_thread_stacks(pid_t pid, pid_t tid);
 
 class Stack
@@ -881,8 +880,7 @@ VOID callBeforeMain()
     if(LOUD)
 	cout << "MAIN CALLED ++++++++++++++++++++++++++++++++++++++++++" << endl;
 
-    if(get_process_stack(getpid()))
-       cerr << "Could not get process stack boundaries\n" ;
+    get_process_stack(getpid());
 
     go = true;
 }
@@ -1416,6 +1414,16 @@ VOID ThreadStart(THREADID threadid, CONTEXT *ctxt, INT32 flags, VOID *v)
 
 }
 
+VOID ThreadFini(THREADID threadid, const CONTEXT *ctxt, INT32 code, VOID *v)
+{
+
+    cerr << "Thread " << threadid << " [" << syscall(SYS_gettid)<< "] is exiting " << endl;
+    cout << "Thread " << threadid << " [" << syscall(SYS_gettid)<< "] is exiting " << endl;
+
+    threadStacks[threadid] = 0;
+}
+
+
 VOID Fini(INT32 code, VOID *v)
 {
     cout << "PR DONE" << endl;
@@ -1454,6 +1462,7 @@ int main(int argc, char *argv[])
 
     IMG_AddInstrumentFunction(Image, 0);
     PIN_AddThreadStartFunction(ThreadStart, 0);
+    PIN_AddThreadFiniFunction(ThreadFini, 0);
     PIN_AddFiniFunction(Fini, 0);
 
     // Never returns
@@ -1466,16 +1475,6 @@ int main(int argc, char *argv[])
 /* ===================================================================== *
  * Various helper routines that do not directly instrument or analyze code
  * ===================================================================== */
-Stack* findByTid(pid_t tid)
-{
-    size_t i;
-    for(i = 0; i< threadStacksSize; i++)
-	if(threadStacks[i] && threadStacks[i]->tid == tid)
-	    return threadStacks[i];
-
-    return NULL;
-}    
-
 void growThreadStacks(int newSize)
 {
     threadStacks = (Stack**)realloc(threadStacks, newSize*sizeof(Stack*));
@@ -1580,6 +1579,7 @@ get_and_refresh_thread_stacks(pid_t pid, pid_t tid)
     {
 	if(!threadStacks[i])
 	    continue;
+
 	Stack *oldStack = threadStacks[i];
 	Stack *newStack = get_thread_stack(pid, oldStack->tid);
 
@@ -1609,128 +1609,12 @@ get_and_refresh_thread_stacks(pid_t pid, pid_t tid)
 	    cerr << "Stack " << *stack << " associated with thread " << 
 		pin_tid << endl; 
 	else
-	    cerr << "Null stack for thread " << tid << "(" << pin_tid << endl;
+	    cerr << "Null stack for thread " << tid << "-" << pin_tid << endl;
     }
 }
 
-int
-get_thread_stacks(pid_t pid, pid_t thisTid)
-{
-    FILE *cmd_output;
-    char *line = NULL;
-    ssize_t bytes_read = 0;
-    size_t len = 0;
 
-    stringstream maps_stream;
-    maps_stream << "cat /proc/"<< pid << "/maps";
-    string maps_command = maps_stream.str();
- 
-    /* This will execute the cat command and pipe
-     * the output to a file handle cmd_output.
-     */
-    cmd_output = popen(maps_command.c_str(), "r");
-    if(cmd_output == NULL)
-    {
-	cerr << "Could not read output from command: "<< maps_command << endl;
-	return -1;
-    }
-    
-    /* Let's read the output line by line until we find all
-     * the thread stack regions. Once we do, parse the start and end.
-     */
-    while(bytes_read != -1)
-    {
-	bytes_read = getline(&line, &len, cmd_output);
-	if(bytes_read > 0)
-	{
-	    string lineStr(line);
-	    size_t pos;
-
-	    if((pos = lineStr.find("[stack:")) != string::npos)
-	    {
-		char *end_ptr = 0;
-		THREADID threadid = PIN_ThreadId();
-
-		/* Let's find the tid of this stack.
-		 * It appears after the literal '[stack:'
-		 */
-		pos = pos + strlen("[stack:");
-		char *search_ptr = line + pos;
-		pid_t parsedTid = strtol(search_ptr, NULL, 10);
-
-		/* Now let's parse the stack boundaries. 
-		 * The first value on the line should be the stack start, 
-		 * then, a '-', and then the stack end.
-		 */
-		size_t stack_start = strtol(line, &end_ptr, 16);
-		if(!end_ptr || end_ptr[0] != '-')
-		{
-		    cerr << "Unexpected line format when parsing thread stacks " << endl;
-		    cerr << "Offending line is: " << endl;
-		    cerr << line << endl;
-		    free(line);
-		    pclose(cmd_output);
-		    return -1;
-		}
-		end_ptr++;
-		size_t stack_end = strtol(end_ptr, NULL, 16);
-
-		Stack *parsedStack = new Stack(stack_start, stack_end, parsedTid);
-
-		/* We might have to update the stack of every thread
-		 * every time a new thread is created, because
-		 * thread stacks sometimes get reallocated. 
-		 */
-		Stack *oldStack = findByTid(parsedTid);
-		if(oldStack != NULL) 
-		{
-		    if(*oldStack != *parsedStack){
-			cerr << "Stack for thread " << parsedTid << 
-			    " got reallocated. " << endl;
-			cerr << "Old stack is: " << *oldStack << endl;
-			cerr << "New stack is: " << *parsedStack << endl;
-			oldStack->start = parsedStack->start;
-			oldStack->end = parsedStack->end;
-		    }
-		    
-		    delete parsedStack;
-		}
-		else
-		{
-		    if(parsedTid != thisTid)
-		    {
-			/* Don't do anything. The thread-owner of this stack
-			 * will record it. 
-			 */
-			cerr << "Unexpected: found a stack for unseen tid " <<
-			    parsedTid << ", but it's not this thread's tid " <<
-			    thisTid << endl;
-		    }
-		    else
-		    {
-			
-			if(threadStacksSize < threadid + 1)
-			    growThreadStacks(threadid+1);
-			threadStacks[threadid] = parsedStack;
-			cerr << "Stack " << *parsedStack << " associated with thread " << 
-			    threadid << endl; 
-			printThreadStacks();
-		    }
-		}
-	    }
-	}
-	if(len > 0)
-	{
-	    free(line);
-	    line = NULL;
-	}
-    }
-
-    pclose(cmd_output);
-    return 0;
-}
-
-int
+void
 get_process_stack(pid_t pid)
 {
     FILE *cmd_output;
@@ -1749,7 +1633,7 @@ get_process_stack(pid_t pid)
     if(cmd_output == NULL)
     {
 	cerr << "Could not read output from command: "<< pmap_command << endl;
-	return -1;
+	return;
     }
 
     /* Let's read the output line by line until we find the
@@ -1791,7 +1675,7 @@ get_process_stack(pid_t pid)
     }
 
     pclose(cmd_output);
-    return 0;
+    return;
 
 }
 
