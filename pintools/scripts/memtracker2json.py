@@ -185,7 +185,7 @@ def parseMemoryAccess(line, out):
         if(i == 8):
             varType = words[i]; 
         if(i > 8):
-            varType = varType + words[i]; 
+            varType = varType + " " + words[i]; 
 
 
 
