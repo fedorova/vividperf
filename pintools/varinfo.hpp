@@ -18,7 +18,7 @@ public:
 	VarInfo();
 
 	/// \!brief Constructs variables data base by a binary file.
-	bool init(const std::string& file, const std::string& prefix);
+	bool init(const std::string& file);
 
 	/// \!brief Returns variable base type given its occurence in the file and its name.
 	const std::string type(const std::string& file, const size_t line, const std::string& name) const;
